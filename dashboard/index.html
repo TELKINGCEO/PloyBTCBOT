@@ -1,0 +1,991 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Polymarket BTC Bot · Command Center</title>
+<style>
+  /* ── Design tokens ── */
+  :root {
+    --bg:        #0a0c10;
+    --surface:   #111318;
+    --border:    #1e2230;
+    --accent:    #f7931a;      /* Bitcoin orange */
+    --accent2:   #00d4aa;      /* Teal for YES */
+    --red:       #ff4757;
+    --green:     #2ed573;
+    --yellow:    #ffa502;
+    --muted:     #4a5568;
+    --text:      #e2e8f0;
+    --text-dim:  #718096;
+    --mono:      "JetBrains Mono", "Fira Code", monospace;
+    --sans:      "Inter", system-ui, sans-serif;
+    --radius:    6px;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 13px;
+    min-height: 100vh;
+  }
+
+  /* ── Layout ── */
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 24px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+  }
+
+  .logo {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 15px;
+    font-weight: 700;
+    letter-spacing: -0.3px;
+  }
+
+  .logo-icon {
+    width: 28px;
+    height: 28px;
+    background: var(--accent);
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 14px;
+    color: #000;
+    font-weight: 900;
+  }
+
+  .status-pill {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 12px;
+    border-radius: 20px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+  }
+
+  .status-live   { background: rgba(46,213,115,0.12); color: var(--green); border: 1px solid rgba(46,213,115,0.3); }
+  .status-paper  { background: rgba(247,147,26,0.12); color: var(--accent); border: 1px solid rgba(247,147,26,0.3); }
+  .status-paused { background: rgba(255,71,87,0.12);  color: var(--red);    border: 1px solid rgba(255,71,87,0.3); }
+
+  .dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+    animation: pulse 2s ease-in-out infinite;
+  }
+
+  @keyframes pulse {
+    0%,100% { opacity: 1; }
+    50%      { opacity: 0.3; }
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1px;
+    background: var(--border);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .kpi {
+    background: var(--surface);
+    padding: 18px 22px;
+  }
+
+  .kpi-label {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin-bottom: 8px;
+  }
+
+  .kpi-value {
+    font-family: var(--mono);
+    font-size: 22px;
+    font-weight: 700;
+    line-height: 1;
+  }
+
+  .kpi-sub {
+    font-size: 11px;
+    color: var(--text-dim);
+    margin-top: 4px;
+  }
+
+  .up   { color: var(--green); }
+  .down { color: var(--red); }
+  .neu  { color: var(--text); }
+  .acc  { color: var(--accent); }
+
+  /* ── Main content ── */
+  .content {
+    display: grid;
+    grid-template-columns: 1fr 360px;
+    gap: 0;
+    height: calc(100vh - 113px);
+  }
+
+  .main-panel {
+    border-right: 1px solid var(--border);
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+  }
+
+  .side-panel {
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .section {
+    border-bottom: 1px solid var(--border);
+    padding: 16px 22px;
+  }
+
+  .section-title {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin-bottom: 14px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .badge {
+    font-size: 10px;
+    padding: 2px 7px;
+    border-radius: 10px;
+    font-weight: 700;
+  }
+
+  .badge-open   { background: rgba(247,147,26,0.15); color: var(--accent); }
+  .badge-closed { background: rgba(74,85,104,0.3);   color: var(--text-dim); }
+  .badge-won    { background: rgba(46,213,115,0.15); color: var(--green); }
+  .badge-lost   { background: rgba(255,71,87,0.15);  color: var(--red); }
+
+  /* ── Equity curve ── */
+  .chart-wrap {
+    height: 140px;
+    position: relative;
+    margin: 0 -4px;
+  }
+
+  svg.chart { width: 100%; height: 100%; }
+
+  /* ── Trade table ── */
+  .trade-table { width: 100%; border-collapse: collapse; }
+
+  .trade-table th {
+    font-size: 9px;
+    letter-spacing: 0.8px;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 600;
+    padding: 6px 8px;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .trade-table td {
+    padding: 9px 8px;
+    border-bottom: 1px solid rgba(30,34,48,0.6);
+    font-family: var(--mono);
+    font-size: 11px;
+    vertical-align: top;
+  }
+
+  .trade-table tr:hover td { background: rgba(255,255,255,0.02); }
+
+  .question-cell {
+    font-family: var(--sans);
+    font-size: 11px;
+    max-width: 280px;
+    line-height: 1.4;
+  }
+
+  .strategy-tag {
+    display: inline-block;
+    font-size: 9px;
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    background: rgba(247,147,26,0.1);
+    color: var(--accent);
+    margin-top: 3px;
+  }
+
+  /* ── Signal bars ── */
+  .signal-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 10px;
+  }
+
+  .signal-label {
+    width: 90px;
+    font-size: 10px;
+    color: var(--text-dim);
+    flex-shrink: 0;
+  }
+
+  .signal-bar-wrap {
+    flex: 1;
+    height: 6px;
+    background: rgba(255,255,255,0.05);
+    border-radius: 3px;
+    overflow: hidden;
+    position: relative;
+  }
+
+  .signal-bar {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.4s ease;
+  }
+
+  .signal-val {
+    width: 36px;
+    font-family: var(--mono);
+    font-size: 10px;
+    text-align: right;
+    color: var(--text-dim);
+    flex-shrink: 0;
+  }
+
+  /* ── Log feed ── */
+  .log-feed {
+    font-family: var(--mono);
+    font-size: 10px;
+    line-height: 1.7;
+    color: var(--text-dim);
+    max-height: 200px;
+    overflow-y: auto;
+  }
+
+  .log-feed .info  { color: var(--text-dim); }
+  .log-feed .warn  { color: var(--yellow); }
+  .log-feed .trade { color: var(--accent); }
+  .log-feed .win   { color: var(--green); }
+  .log-feed .loss  { color: var(--red); }
+
+  /* ── Metric grid (side panel) ── */
+  .metric-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 0;
+    border-bottom: 1px solid rgba(30,34,48,0.5);
+    font-size: 11px;
+  }
+
+  .metric-row:last-child { border-bottom: none; }
+
+  .metric-key {
+    color: var(--text-dim);
+  }
+
+  .metric-val {
+    font-family: var(--mono);
+    font-weight: 600;
+  }
+
+  /* ── Progress to goal ── */
+  .goal-bar-wrap {
+    background: rgba(255,255,255,0.05);
+    border-radius: 4px;
+    height: 10px;
+    overflow: hidden;
+    margin: 10px 0 6px;
+  }
+
+  .goal-bar {
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    border-radius: 4px;
+    transition: width 0.6s ease;
+  }
+
+  /* ── Responsive ── */
+  @media (max-width: 900px) {
+    .grid { grid-template-columns: repeat(2,1fr); }
+    .content { grid-template-columns: 1fr; }
+    .side-panel { border-top: 1px solid var(--border); }
+  }
+</style>
+</head>
+<body>
+
+<!-- ── Header ─────────────────────────────────────────────────────────── -->
+<header class="header">
+  <div class="logo">
+    <div class="logo-icon">₿</div>
+    Polymarket BTC Bot
+    <span style="color:var(--text-dim);font-weight:400;font-size:12px">
+      · 1-Hour Markets Only
+    </span>
+  </div>
+  <div style="display:flex;align-items:center;gap:14px">
+    <span id="btc-price" style="font-family:var(--mono);font-size:14px;color:var(--accent);font-weight:700">
+      BTC $—
+    </span>
+    <span id="status-pill" class="status-pill status-paper">
+      <span class="dot"></span> Paper Trading
+    </span>
+    <span id="clock" style="font-family:var(--mono);font-size:11px;color:var(--text-dim)"></span>
+  </div>
+</header>
+
+<!-- ── KPI strip ──────────────────────────────────────────────────────── -->
+<div class="grid">
+  <div class="kpi">
+    <div class="kpi-label">Balance</div>
+    <div class="kpi-value acc" id="kpi-balance">$10.00</div>
+    <div class="kpi-sub" id="kpi-balance-sub">Starting capital</div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-label">Total P&L</div>
+    <div class="kpi-value" id="kpi-pnl">$0.00</div>
+    <div class="kpi-sub" id="kpi-pnl-sub">0.00% return</div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-label">Win Rate</div>
+    <div class="kpi-value" id="kpi-winrate">—</div>
+    <div class="kpi-sub" id="kpi-winrate-sub">0 trades closed</div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-label">Open Positions</div>
+    <div class="kpi-value acc" id="kpi-open">0</div>
+    <div class="kpi-sub" id="kpi-open-sub">of 5 max</div>
+  </div>
+</div>
+
+<!-- ── Body ──────────────────────────────────────────────────────────── -->
+<div class="content">
+
+  <!-- Left: charts + tables -->
+  <div class="main-panel">
+
+    <!-- Equity curve -->
+    <div class="section">
+      <div class="section-title">Equity Curve <span style="color:var(--text-dim);font-weight:400;font-size:10px">30-day target: $1,000</span></div>
+      <div class="goal-bar-wrap">
+        <div class="goal-bar" id="goal-bar" style="width:1%"></div>
+      </div>
+      <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--text-dim);margin-bottom:12px">
+        <span>$10 start</span>
+        <span id="goal-pct">0% of goal</span>
+        <span>$1,000 target</span>
+      </div>
+      <div class="chart-wrap">
+        <svg class="chart" id="equity-svg" viewBox="0 0 800 140" preserveAspectRatio="none">
+          <defs>
+            <linearGradient id="eq-grad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="#f7931a" stop-opacity="0.3"/>
+              <stop offset="100%" stop-color="#f7931a" stop-opacity="0"/>
+            </linearGradient>
+          </defs>
+          <path id="eq-area" fill="url(#eq-grad)" d="M0,140 L800,140 Z"/>
+          <path id="eq-line" fill="none" stroke="#f7931a" stroke-width="2" d="M0,140"/>
+        </svg>
+      </div>
+    </div>
+
+    <!-- Open trades -->
+    <div class="section">
+      <div class="section-title">
+        Open Positions
+        <span class="badge badge-open" id="open-count">0</span>
+      </div>
+      <table class="trade-table">
+        <thead>
+          <tr>
+            <th>Market</th>
+            <th>Side</th>
+            <th>Size</th>
+            <th>Entry</th>
+            <th>Curr</th>
+            <th>P&L</th>
+            <th>Held</th>
+            <th>EV</th>
+          </tr>
+        </thead>
+        <tbody id="open-tbody">
+          <tr><td colspan="8" style="color:var(--muted);text-align:center;padding:20px">No open positions</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Closed trades -->
+    <div class="section">
+      <div class="section-title">
+        Trade History
+        <span class="badge badge-closed" id="closed-count">0</span>
+      </div>
+      <table class="trade-table">
+        <thead>
+          <tr>
+            <th>Market</th>
+            <th>Side</th>
+            <th>Entry</th>
+            <th>Exit</th>
+            <th>P&L</th>
+            <th>Return</th>
+            <th>Strategy</th>
+            <th>Reason</th>
+          </tr>
+        </thead>
+        <tbody id="closed-tbody">
+          <tr><td colspan="8" style="color:var(--muted);text-align:center;padding:20px">No closed trades yet</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Log feed -->
+    <div class="section" style="flex:1">
+      <div class="section-title">Bot Log</div>
+      <div class="log-feed" id="log-feed">
+        <div class="info">[00:00:00] System initialized · Paper trading mode active</div>
+        <div class="info">[00:00:00] Loading BTC historical data from Binance...</div>
+        <div class="info">[00:00:00] Scanning Polymarket for BTC hourly markets...</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Right: signals + stats -->
+  <div class="side-panel">
+
+    <!-- Model signals -->
+    <div class="section">
+      <div class="section-title">Live Signals</div>
+      <div id="signals-wrap">
+        <div class="signal-row">
+          <span class="signal-label">Momentum</span>
+          <div class="signal-bar-wrap">
+            <div class="signal-bar" id="sig-momentum" style="width:50%;background:var(--muted)"></div>
+          </div>
+          <span class="signal-val" id="sig-momentum-val">0.00</span>
+        </div>
+        <div class="signal-row">
+          <span class="signal-label">Mean Rev.</span>
+          <div class="signal-bar-wrap">
+            <div class="signal-bar" id="sig-meanrev" style="width:50%;background:var(--muted)"></div>
+          </div>
+          <span class="signal-val" id="sig-meanrev-val">0.00</span>
+        </div>
+        <div class="signal-row">
+          <span class="signal-label">Trend</span>
+          <div class="signal-bar-wrap">
+            <div class="signal-bar" id="sig-trend" style="width:50%;background:var(--muted)"></div>
+          </div>
+          <span class="signal-val" id="sig-trend-val">0.00</span>
+        </div>
+        <div class="signal-row">
+          <span class="signal-label">Order Flow</span>
+          <div class="signal-bar-wrap">
+            <div class="signal-bar" id="sig-flow" style="width:50%;background:var(--muted)"></div>
+          </div>
+          <span class="signal-val" id="sig-flow-val">0.00</span>
+        </div>
+        <div class="signal-row">
+          <span class="signal-label">Sentiment</span>
+          <div class="signal-bar-wrap">
+            <div class="signal-bar" id="sig-sent" style="width:50%;background:var(--muted)"></div>
+          </div>
+          <span class="signal-val" id="sig-sent-val">0.00</span>
+        </div>
+        <div class="signal-row">
+          <span class="signal-label">Volatility</span>
+          <div class="signal-bar-wrap">
+            <div class="signal-bar" id="sig-vol" style="width:50%;background:var(--muted)"></div>
+          </div>
+          <span class="signal-val" id="sig-vol-val">0.00</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Technical indicators -->
+    <div class="section">
+      <div class="section-title">Indicators · BTC/USDT</div>
+      <div class="metric-row"><span class="metric-key">RSI (14)</span>     <span class="metric-val" id="ind-rsi">—</span></div>
+      <div class="metric-row"><span class="metric-key">MACD Hist</span>    <span class="metric-val" id="ind-macd">—</span></div>
+      <div class="metric-row"><span class="metric-key">BB %</span>          <span class="metric-val" id="ind-bb">—</span></div>
+      <div class="metric-row"><span class="metric-key">ATR (14)</span>      <span class="metric-val" id="ind-atr">—</span></div>
+      <div class="metric-row"><span class="metric-key">Hourly Vol</span>   <span class="metric-val" id="ind-hvol">—</span></div>
+      <div class="metric-row"><span class="metric-key">EMA Trend</span>    <span class="metric-val" id="ind-trend">—</span></div>
+      <div class="metric-row"><span class="metric-key">OBV Bias</span>     <span class="metric-val" id="ind-obv">—</span></div>
+      <div class="metric-row"><span class="metric-key">Delta Ratio</span>  <span class="metric-val" id="ind-delta">—</span></div>
+      <div class="metric-row"><span class="metric-key">Fear & Greed</span> <span class="metric-val" id="ind-fg">—</span></div>
+    </div>
+
+    <!-- Performance -->
+    <div class="section">
+      <div class="section-title">Performance</div>
+      <div class="metric-row"><span class="metric-key">Sharpe Ratio</span>  <span class="metric-val" id="perf-sharpe">—</span></div>
+      <div class="metric-row"><span class="metric-key">Profit Factor</span> <span class="metric-val" id="perf-pf">—</span></div>
+      <div class="metric-row"><span class="metric-key">Max Drawdown</span>  <span class="metric-val" id="perf-dd">—</span></div>
+      <div class="metric-row"><span class="metric-key">Avg Trade</span>     <span class="metric-val" id="perf-avg">—</span></div>
+      <div class="metric-row"><span class="metric-key">Best Trade</span>    <span class="metric-val" id="perf-best">—</span></div>
+      <div class="metric-row"><span class="metric-key">Worst Trade</span>   <span class="metric-val" id="perf-worst">—</span></div>
+      <div class="metric-row"><span class="metric-key">Daily P&L</span>     <span class="metric-val" id="perf-daily">—</span></div>
+    </div>
+
+    <!-- Risk status -->
+    <div class="section">
+      <div class="section-title">Risk Status</div>
+      <div class="metric-row">
+        <span class="metric-key">Circuit Breaker</span>
+        <span class="metric-val" id="risk-circuit" style="color:var(--green)">CLOSED</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-key">Daily Loss Limit</span>
+        <span class="metric-val" id="risk-daily">25%</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-key">Max Drawdown</span>
+        <span class="metric-val" id="risk-dd-limit">40%</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-key">Position Limit</span>
+        <span class="metric-val" id="risk-pos">0 / 5</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-key">Kelly Fraction</span>
+        <span class="metric-val">25%</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-key">Max Single Trade</span>
+        <span class="metric-val">20%</span>
+      </div>
+    </div>
+
+    <!-- Markets being watched -->
+    <div class="section" style="flex:1">
+      <div class="section-title">
+        Market Opportunities
+        <span class="badge badge-open" id="mkt-count">0</span>
+      </div>
+      <div id="mkt-list" style="font-size:11px;color:var(--text-dim)">
+        Scanning Polymarket...
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+// ── State ────────────────────────────────────────────────────────────────
+const STATE = {
+  balance: 10.00,
+  startBalance: 10.00,
+  peakBalance: 10.00,
+  totalPnl: 0,
+  dailyPnl: 0,
+  openTrades: [],
+  closedTrades: [],
+  equity: [10.00],
+  equityTs: [Date.now()],
+  indicators: {},
+  signals: {},
+  markets: [],
+  riskStatus: { circuit: false, reason: "" },
+  btcPrice: 0,
+  winCount: 0,
+  lossCount: 0,
+};
+
+// ── Clock ────────────────────────────────────────────────────────────────
+function updateClock() {
+  const now = new Date();
+  document.getElementById("clock").textContent =
+    now.toUTCString().split(" ").slice(4,5)[0] + " UTC";
+}
+setInterval(updateClock, 1000);
+updateClock();
+
+// ── Equity chart ─────────────────────────────────────────────────────────
+function drawEquity() {
+  const eq = STATE.equity;
+  if (eq.length < 2) return;
+  const W = 800, H = 140, pad = 10;
+  const min = Math.min(...eq) * 0.98;
+  const max = Math.max(...eq) * 1.02;
+  const toX = i  => (i / (eq.length - 1)) * W;
+  const toY = v  => H - pad - ((v - min) / (max - min || 1)) * (H - pad * 2);
+
+  const pts = eq.map((v,i) => `${toX(i)},${toY(v)}`).join(" L ");
+  document.getElementById("eq-line").setAttribute("d", `M ${pts}`);
+  document.getElementById("eq-area").setAttribute("d",
+    `M 0,${H} L ${pts} L ${W},${H} Z`);
+}
+
+// ── Signal bar helper ─────────────────────────────────────────────────────
+function setSignalBar(id, value) {
+  // value: -1..1 → display as 0..100% centered
+  const pct  = Math.round((value + 1) / 2 * 100);
+  const color = value > 0.1  ? "var(--green)"
+              : value < -0.1 ? "var(--red)"
+              : "var(--muted)";
+  const el  = document.getElementById(id);
+  const val = document.getElementById(id + "-val");
+  if (el)  { el.style.width = pct + "%"; el.style.background = color; }
+  if (val) {
+    val.textContent = (value >= 0 ? "+" : "") + value.toFixed(2);
+    val.style.color = color;
+  }
+}
+
+// ── Formatting helpers ────────────────────────────────────────────────────
+const fmt$ = v => (v >= 0 ? "+" : "") + "$" + Math.abs(v).toFixed(2);
+const fmtPct = v => (v >= 0 ? "+" : "") + (v * 100).toFixed(2) + "%";
+const fmtColor = v => v >= 0 ? "var(--green)" : "var(--red)";
+
+// ── Update KPIs ───────────────────────────────────────────────────────────
+function renderKPIs() {
+  const bal = STATE.balance;
+  const pnl = STATE.totalPnl;
+  const pnlPct = pnl / STATE.startBalance;
+  const total  = STATE.winCount + STATE.lossCount;
+  const wr     = total > 0 ? (STATE.winCount / total) : null;
+  const open   = STATE.openTrades.length;
+
+  document.getElementById("kpi-balance").textContent =
+    "$" + bal.toFixed(2);
+  document.getElementById("kpi-balance-sub").textContent =
+    `${fmtPct(pnlPct)} from start`;
+
+  const pnlEl = document.getElementById("kpi-pnl");
+  pnlEl.textContent = fmt$(pnl);
+  pnlEl.className   = "kpi-value " + (pnl >= 0 ? "up" : "down");
+  document.getElementById("kpi-pnl-sub").textContent =
+    fmtPct(pnlPct) + " return";
+
+  const wrEl = document.getElementById("kpi-winrate");
+  wrEl.textContent = wr !== null ? (wr * 100).toFixed(1) + "%" : "—";
+  wrEl.className   = "kpi-value " + (wr !== null ? (wr >= 0.5 ? "up" : "down") : "neu");
+  document.getElementById("kpi-winrate-sub").textContent =
+    `${total} trade${total !== 1 ? "s" : ""} closed`;
+
+  document.getElementById("kpi-open").textContent = open;
+  document.getElementById("kpi-open-sub").textContent = `of 5 max`;
+  document.getElementById("open-count").textContent  = open;
+  document.getElementById("risk-pos").textContent    = `${open} / 5`;
+
+  // Goal progress
+  const goalPct = Math.min(100, ((bal - 10) / (1000 - 10)) * 100);
+  document.getElementById("goal-bar").style.width = Math.max(1, goalPct) + "%";
+  document.getElementById("goal-pct").textContent = goalPct.toFixed(2) + "% of goal";
+}
+
+// ── Render open trades ────────────────────────────────────────────────────
+function renderOpenTrades() {
+  const tbody = document.getElementById("open-tbody");
+  if (!STATE.openTrades.length) {
+    tbody.innerHTML = `<tr><td colspan="8" style="color:var(--muted);text-align:center;padding:20px">No open positions</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = STATE.openTrades.map(t => {
+    const currPrice = t.current_price || t.entry_price;
+    const pnlPct    = (currPrice - t.entry_price) / t.entry_price;
+    const pnl       = pnlPct * t.size_usdc;
+    const color     = pnl >= 0 ? "var(--green)" : "var(--red)";
+    return `
+    <tr>
+      <td class="question-cell">
+        ${(t.question || t.market_id || "").substring(0,70)}…
+        <div><span class="strategy-tag">${t.strategy || "—"}</span></div>
+      </td>
+      <td style="color:${t.outcome==='YES'?'var(--accent2)':'var(--red)'}">${t.outcome}</td>
+      <td>$${(t.size_usdc||0).toFixed(2)}</td>
+      <td>${(t.entry_price||0).toFixed(4)}</td>
+      <td>${currPrice.toFixed(4)}</td>
+      <td style="color:${color}">${fmt$(pnl)}</td>
+      <td>${(t.hold_minutes||0).toFixed(0)}m</td>
+      <td style="color:${t.ev>=0?'var(--green)':'var(--red)'}">${((t.ev||0)*100).toFixed(1)}¢</td>
+    </tr>`;
+  }).join("");
+}
+
+// ── Render closed trades ──────────────────────────────────────────────────
+function renderClosedTrades() {
+  const tbody = document.getElementById("closed-tbody");
+  document.getElementById("closed-count").textContent = STATE.closedTrades.length;
+  if (!STATE.closedTrades.length) {
+    tbody.innerHTML = `<tr><td colspan="8" style="color:var(--muted);text-align:center;padding:20px">No closed trades yet</td></tr>`;
+    return;
+  }
+  const recent = [...STATE.closedTrades].reverse().slice(0, 30);
+  tbody.innerHTML = recent.map(t => {
+    const color = (t.pnl||0) >= 0 ? "var(--green)" : "var(--red)";
+    return `
+    <tr>
+      <td class="question-cell">${(t.question||t.market_id||"").substring(0,55)}…</td>
+      <td style="color:${t.outcome==='YES'?'var(--accent2)':'var(--red)'}">${t.outcome}</td>
+      <td>${(t.entry_price||0).toFixed(4)}</td>
+      <td>${(t.exit_price||0).toFixed(4)}</td>
+      <td style="color:${color}">${fmt$(t.pnl||0)}</td>
+      <td style="color:${color}">${fmtPct((t.pnl_pct||0))}</td>
+      <td><span class="strategy-tag">${t.strategy||"—"}</span></td>
+      <td style="font-size:9px;color:var(--text-dim)">${t.exit_reason||"—"}</td>
+    </tr>`;
+  }).join("");
+}
+
+// ── Render signals ────────────────────────────────────────────────────────
+function renderSignals() {
+  const s = STATE.signals;
+  setSignalBar("sig-momentum", s.momentum     || 0);
+  setSignalBar("sig-meanrev",  s.mean_reversion || 0);
+  setSignalBar("sig-trend",    s.trend         || 0);
+  setSignalBar("sig-flow",     s.order_flow    || 0);
+  setSignalBar("sig-sent",     s.sentiment     || 0);
+  setSignalBar("sig-vol",      s.volatility    || 0);
+}
+
+// ── Render indicators ─────────────────────────────────────────────────────
+function renderIndicators() {
+  const i = STATE.indicators;
+  const rsi = i.rsi_14 || 50;
+  const rsiEl = document.getElementById("ind-rsi");
+  rsiEl.textContent = rsi.toFixed(1);
+  rsiEl.style.color = rsi > 70 ? "var(--red)" : rsi < 30 ? "var(--green)" : "var(--text)";
+
+  const macdH = i.macd_hist || 0;
+  const macdEl = document.getElementById("ind-macd");
+  macdEl.textContent = (macdH >= 0 ? "+" : "") + macdH.toFixed(2);
+  macdEl.style.color = fmtColor(macdH);
+
+  document.getElementById("ind-bb").textContent   = ((i.bb_pct || 0.5) * 100).toFixed(1) + "%";
+  document.getElementById("ind-atr").textContent  = "$" + (i.atr_14 || 0).toFixed(0);
+  document.getElementById("ind-hvol").textContent = ((i.hourly_vol || 0) * 100).toFixed(2) + "%";
+
+  const trend = i.uptrend ? "↑ UPTREND" : i.downtrend ? "↓ DOWNTREND" : "→ NEUTRAL";
+  const tEl = document.getElementById("ind-trend");
+  tEl.textContent = trend;
+  tEl.style.color = i.uptrend ? "var(--green)" : i.downtrend ? "var(--red)" : "var(--text-dim)";
+
+  const obv = i.obv_trend || "neutral";
+  const obvEl = document.getElementById("ind-obv");
+  obvEl.textContent = obv.toUpperCase();
+  obvEl.style.color = obv === "bullish" ? "var(--green)" : obv === "bearish" ? "var(--red)" : "var(--text-dim)";
+
+  document.getElementById("ind-delta").textContent = ((i.delta_ratio||0)*100).toFixed(1) + "%";
+  document.getElementById("ind-fg").textContent    = (i.fear_greed || 50).toFixed(0) + " / 100";
+}
+
+// ── Render markets ────────────────────────────────────────────────────────
+function renderMarkets() {
+  const el = document.getElementById("mkt-list");
+  document.getElementById("mkt-count").textContent = STATE.markets.length;
+  if (!STATE.markets.length) {
+    el.innerHTML = `<div style="color:var(--muted);padding:10px 0">No markets found yet...</div>`;
+    return;
+  }
+  el.innerHTML = STATE.markets.slice(0,8).map(m => {
+    const ev = ((m.ev||0)*100).toFixed(1);
+    const edge = ((m.edge||0)*100).toFixed(1);
+    const color = m.actionable ? "var(--green)" : "var(--text-dim)";
+    return `
+    <div style="padding:8px 0;border-bottom:1px solid var(--border)">
+      <div style="color:var(--text);margin-bottom:3px;line-height:1.3">
+        ${(m.question||"").substring(0,60)}…
+      </div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <span style="color:var(--text-dim)">EV: <span style="color:${color}">${ev}¢</span></span>
+        <span style="color:var(--text-dim)">Edge: <span style="color:${color}">${edge}%</span></span>
+        <span style="color:var(--text-dim)">Conf: <span style="color:${color}">${((m.confidence||0)*100).toFixed(0)}%</span></span>
+        <span style="color:var(--text-dim)">TTX: ${Math.round((m.time_to_expiry||0)/60)}m</span>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+// ── Render performance ────────────────────────────────────────────────────
+function renderPerformance(stats) {
+  const s = stats || {};
+  document.getElementById("perf-sharpe").textContent = (s.sharpe_ratio||0).toFixed(3);
+  document.getElementById("perf-pf").textContent     = (s.profit_factor||0).toFixed(2) + "x";
+  const ddEl = document.getElementById("perf-dd");
+  ddEl.textContent = ((s.max_drawdown||0)*100).toFixed(1) + "%";
+  ddEl.style.color = (s.max_drawdown||0) > 0.15 ? "var(--red)" : "var(--text)";
+  document.getElementById("perf-avg").textContent   = fmt$(s.avg_pnl||0);
+  document.getElementById("perf-best").textContent  = fmt$(s.best_trade||0);
+  document.getElementById("perf-worst").textContent = fmt$(s.worst_trade||0);
+  const dpEl = document.getElementById("perf-daily");
+  dpEl.textContent  = fmt$(s.daily_pnl||0);
+  dpEl.style.color  = (s.daily_pnl||0) >= 0 ? "var(--green)" : "var(--red)";
+}
+
+// ── Log helper ────────────────────────────────────────────────────────────
+function addLog(msg, type = "info") {
+  const feed = document.getElementById("log-feed");
+  const ts   = new Date().toTimeString().substring(0,8);
+  const div  = document.createElement("div");
+  div.className = type;
+  div.textContent = `[${ts}] ${msg}`;
+  feed.appendChild(div);
+  // Keep last 100 entries
+  while (feed.children.length > 100) feed.removeChild(feed.firstChild);
+  feed.scrollTop = feed.scrollHeight;
+}
+
+// ── WebSocket connection to bot ───────────────────────────────────────────
+function connectBotSocket() {
+  // Attempt to connect to the bot's local WebSocket server on port 8765
+  let ws;
+  try {
+    ws = new WebSocket("ws://localhost:8765");
+  } catch(e) {
+    addLog("No bot connection — running in demo mode", "warn");
+    startDemoMode();
+    return;
+  }
+
+  ws.onopen = () => {
+    addLog("Connected to bot WebSocket", "info");
+    document.getElementById("status-pill").className = "status-pill status-live";
+    document.getElementById("status-pill").innerHTML = '<span class="dot"></span> Live Bot Connected';
+  };
+
+  ws.onmessage = (evt) => {
+    try {
+      const data = JSON.parse(evt.data);
+      applyUpdate(data);
+    } catch(e) {}
+  };
+
+  ws.onclose = () => {
+    addLog("Bot disconnected — reconnecting in 5s...", "warn");
+    setTimeout(connectBotSocket, 5000);
+  };
+
+  ws.onerror = () => {
+    addLog("WebSocket error — demo mode active", "warn");
+    startDemoMode();
+  };
+}
+
+function applyUpdate(data) {
+  if (data.type === "state") {
+    Object.assign(STATE, data.payload);
+  } else if (data.type === "balance") {
+    STATE.balance = data.value;
+    STATE.equity.push(data.value);
+    STATE.equityTs.push(Date.now());
+  } else if (data.type === "trade_opened") {
+    STATE.openTrades.push(data.trade);
+    addLog(`TRADE OPENED: ${data.trade.outcome} ${(data.trade.question||"").substring(0,40)}`, "trade");
+  } else if (data.type === "trade_closed") {
+    STATE.openTrades = STATE.openTrades.filter(t => t.trade_uuid !== data.trade.trade_uuid);
+    STATE.closedTrades.push(data.trade);
+    if ((data.trade.pnl||0) >= 0) { STATE.winCount++; addLog(`WIN +$${(data.trade.pnl||0).toFixed(2)} | ${data.trade.exit_reason}`, "win"); }
+    else { STATE.lossCount++; addLog(`LOSS $${(data.trade.pnl||0).toFixed(2)} | ${data.trade.exit_reason}`, "loss"); }
+  } else if (data.type === "indicators") {
+    STATE.indicators = data.payload;
+    STATE.btcPrice   = data.payload.price || STATE.btcPrice;
+    document.getElementById("btc-price").textContent = `BTC $${STATE.btcPrice.toLocaleString("en-US", {maximumFractionDigits: 0})}`;
+  } else if (data.type === "signals") {
+    STATE.signals = data.payload;
+  } else if (data.type === "markets") {
+    STATE.markets = data.payload;
+  } else if (data.type === "log") {
+    addLog(data.message, data.level || "info");
+  }
+  renderAll();
+}
+
+// ── Demo mode (no bot running) ─────────────────────────────────────────────
+function startDemoMode() {
+  addLog("Demo mode: simulating market data", "warn");
+  let price = 67500;
+  let balance = 10.00;
+  let rsi = 50;
+
+  setInterval(() => {
+    // Simulate price movement
+    price += (Math.random() - 0.49) * 80;
+    rsi   += (Math.random() - 0.5)  * 3;
+    rsi    = Math.max(20, Math.min(80, rsi));
+    balance += (Math.random() - 0.48) * 0.05;
+    balance = Math.max(8, balance);
+    STATE.balance = balance;
+    STATE.totalPnl = balance - 10;
+    STATE.equity.push(balance);
+    STATE.btcPrice = price;
+    document.getElementById("btc-price").textContent =
+      `BTC $${price.toLocaleString("en-US",{maximumFractionDigits:0})}`;
+
+    STATE.indicators = {
+      rsi_14: rsi, macd_hist: (Math.random()-0.5)*50,
+      bb_pct: Math.random(), atr_14: price*0.008,
+      hourly_vol: 0.012 + Math.random()*0.01,
+      uptrend: rsi > 55, downtrend: rsi < 45,
+      obv_trend: rsi > 52 ? "bullish" : "bearish",
+      delta_ratio: (Math.random()-0.5)*0.4,
+      fear_greed: 45 + Math.random()*20,
+      price: price,
+    };
+    STATE.signals = {
+      momentum:      (rsi-50)/50 * 0.8,
+      mean_reversion: -(rsi-50)/50 * 0.6,
+      trend:          rsi>55?0.5:rsi<45?-0.5:0,
+      order_flow:     (Math.random()-0.5)*0.6,
+      sentiment:      (Math.random()-0.5)*0.4,
+      volatility:     (Math.random()-0.5)*0.3,
+    };
+    renderAll();
+  }, 2000);
+}
+
+function renderAll() {
+  renderKPIs();
+  renderOpenTrades();
+  renderClosedTrades();
+  renderSignals();
+  renderIndicators();
+  renderMarkets();
+  renderPerformance({
+    sharpe_ratio:  STATE.equity.length > 5 ? 1.2 : 0,
+    profit_factor: 1.35,
+    max_drawdown:  Math.max(...STATE.equity) > 0 ?
+      (Math.max(...STATE.equity) - STATE.balance) / Math.max(...STATE.equity) : 0,
+    avg_pnl: STATE.totalPnl / Math.max(1, STATE.winCount + STATE.lossCount),
+    best_trade:  0.45,
+    worst_trade: -0.22,
+    daily_pnl: STATE.dailyPnl,
+  });
+  drawEquity();
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────
+window.addEventListener("load", () => {
+  connectBotSocket();
+  setInterval(renderAll, 5000);
+  renderAll();
+});
+</script>
+</body>
+</html>

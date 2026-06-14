@@ -1,0 +1,10 @@
+# Polymarket BTC Trading Bot - Requirements
+aiohttp>=3.9.0
+websockets>=12.0
+python-dotenv>=1.0.0
+numpy>=1.26.0
+
+# Optional: heavier analytics (uncomment if needed)
+# pandas>=2.1.0
+# scikit-learn>=1.3.0
+# scipy>=1.11.0
