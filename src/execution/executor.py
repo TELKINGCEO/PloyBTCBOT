@@ -26,6 +26,7 @@ class ExecutionEngine:
         self.risk = risk_manager
         self.db   = db
         self.cfg  = config
+        self.tg   = None  # Injected from main.py
         self._open_orders: Dict[str, Dict] = {}   # trade_uuid → order metadata
 
     # ─────────────────────────────────────────────────────────────────────
@@ -50,18 +51,18 @@ class ExecutionEngine:
 
         # Place order
         fill = await self.pm.place_order(
-            token_id   = token_id,
-            side       = "BUY",
-            size       = size_result.size_usdc,
-            price      = signal.entry_price,
+            token_id = token_id,
+            side     = "BUY",
+            size     = size_result.size_usdc,
+            price    = signal.entry_price,
         )
 
         if not fill:
             logger.warning(f"Order failed for {signal.market_id}")
             return None
 
-        fill_price = float(fill.get("fillPrice", signal.entry_price))
-        fill_size  = float(fill.get("fillSize",  size_result.size_usdc / fill_price))
+        fill_price  = float(fill.get("fillPrice", signal.entry_price))
+        fill_size   = float(fill.get("fillSize",  size_result.size_usdc / fill_price))
         actual_cost = fill_price * fill_size
 
         # Save to DB
@@ -83,17 +84,17 @@ class ExecutionEngine:
         })
 
         trade = {
-            "trade_uuid":         trade_uuid,
-            "market_id":          signal.market_id,
-            "outcome":            signal.outcome,
-            "direction":          "BUY",
-            "size_usdc":          round(actual_cost, 4),
-            "shares":             round(fill_size, 4),
-            "entry_price":        round(fill_price, 6),
-            "entry_time":         int(time.time()),
-            "status":             "OPEN",
-            "strategy":           signal.strategy,
-            "prediction_id":      pred_id,
+            "trade_uuid":          trade_uuid,
+            "market_id":           signal.market_id,
+            "outcome":             signal.outcome,
+            "direction":           "BUY",
+            "size_usdc":           round(actual_cost, 4),
+            "shares":              round(fill_size, 4),
+            "entry_price":         round(fill_price, 6),
+            "entry_time":          int(time.time()),
+            "status":              "OPEN",
+            "strategy":            signal.strategy,
+            "prediction_id":       pred_id,
             "polymarket_order_id": fill.get("orderId", ""),
         }
 
@@ -126,7 +127,7 @@ class ExecutionEngine:
             logger.warning(f"No cached order found: {trade_uuid}")
             return False
 
-        shares     = order.get("shares", 0)
+        shares      = order.get("shares", 0)
         entry_price = order.get("entry_price", 0)
 
         # Get current market price
@@ -159,18 +160,18 @@ class ExecutionEngine:
 
         # Update DB
         self.db.close_trade(trade_uuid, exit_price, pnl, pnl_pct, reason)
-        self.db.close_trade(trade_uuid, exit_price, pnl, pnl_pct, reason)
 
-# ADD THESE LINES BELOW:
-if hasattr(self, 'tg') and self.tg:
-    asyncio.create_task(self.tg.trade_closed({
-        "question":    trade.get("question", ""),
-        "outcome":     trade.get("outcome"),
-        "pnl":         pnl,
-        "pnl_pct":     pnl_pct,
-        "exit_reason": reason,
-        "strategy":    trade.get("strategy"),
-    }))                         
+        # Send Telegram alert
+        if hasattr(self, 'tg') and self.tg:
+            asyncio.create_task(self.tg.trade_closed({
+                "question":    order.get("question", ""),
+                "outcome":     order.get("outcome"),
+                "pnl":         pnl,
+                "pnl_pct":     pnl_pct,
+                "exit_reason": reason,
+                "strategy":    order.get("strategy"),
+            }))
+
         self.risk.on_trade_close(trade_uuid, pnl)
 
         # Remove from cache
@@ -192,7 +193,7 @@ if hasattr(self, 'tg') and self.tg:
         if not self._open_orders:
             return
 
-        now = int(time.time())
+        now      = int(time.time())
         to_close = []
 
         for trade_uuid, order in list(self._open_orders.items()):
@@ -209,12 +210,17 @@ if hasattr(self, 'tg') and self.tg:
                 # Get updated model probability
                 signal = order.get("signal")
                 if signal:
-                    updated = analysis_engine.analyze_market(signal.__dict__ if hasattr(signal, '__dict__') else {
-                        "id": market_id, "question": order.get("question", ""),
-                        "outcome_prices": json.dumps([yes_p, no_p]),
-                        "time_to_expiry": max(0, expiry - now),
-                    })
-                    model_prob = updated.predicted_prob if updated else (yes_p if outcome == "YES" else no_p)
+                    updated = analysis_engine.analyze_market(
+                        signal.__dict__ if hasattr(signal, '__dict__') else {
+                            "id":             market_id,
+                            "question":       order.get("question", ""),
+                            "outcome_prices": json.dumps([yes_p, no_p]),
+                            "time_to_expiry": max(0, expiry - now),
+                        }
+                    )
+                    model_prob = updated.predicted_prob if updated else (
+                        yes_p if outcome == "YES" else no_p
+                    )
                 else:
                     model_prob = current_price
 
@@ -230,8 +236,8 @@ if hasattr(self, 'tg') and self.tg:
 
                 # Market expired?
                 if now >= expiry - 60:
-                    should_exit  = True
-                    exit_reason  = "MARKET_EXPIRY"
+                    should_exit = True
+                    exit_reason = "MARKET_EXPIRY"
 
                 if should_exit:
                     to_close.append((trade_uuid, exit_reason, current_price))
@@ -253,8 +259,6 @@ if hasattr(self, 'tg') and self.tg:
         Token IDs are the ERC1155 token addresses for YES/NO shares.
         For paper trading we use a synthetic ID.
         """
-        # Real production code would look up: market["tokens"][0]["token_id"] for YES
-        # and market["tokens"][1]["token_id"] for NO
         return f"{market_id}_{outcome}"
 
     def get_open_positions_summary(self) -> List[Dict]:
