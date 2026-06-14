@@ -61,6 +61,8 @@ class APIConfig:
     # Alternative Data
     FEAR_GREED_URL: str = "https://api.alternative.me/fng/"
     GLASSNODE_API_KEY: str = os.getenv("GLASSNODE_API_KEY", "")
+    TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    TELEGRAM_CHAT_ID:   str = os.getenv("TELEGRAM_CHAT_ID", "")
 
 @dataclass
 class DatabaseConfig:
