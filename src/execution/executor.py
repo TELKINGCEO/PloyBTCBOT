@@ -159,6 +159,18 @@ class ExecutionEngine:
 
         # Update DB
         self.db.close_trade(trade_uuid, exit_price, pnl, pnl_pct, reason)
+        self.db.close_trade(trade_uuid, exit_price, pnl, pnl_pct, reason)
+
+# ADD THESE LINES BELOW:
+if hasattr(self, 'tg') and self.tg:
+    asyncio.create_task(self.tg.trade_closed({
+        "question":    trade.get("question", ""),
+        "outcome":     trade.get("outcome"),
+        "pnl":         pnl,
+        "pnl_pct":     pnl_pct,
+        "exit_reason": reason,
+        "strategy":    trade.get("strategy"),
+    }))                         
         self.risk.on_trade_close(trade_uuid, pnl)
 
         # Remove from cache
