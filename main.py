@@ -8,6 +8,7 @@ import json
 import logging
 import sys
 import os
+from src.utils.telegram_bot import TelegramBot
 from datetime import datetime, timezone
 
 # ── Path setup ────────────────────────────────────────────────────────────
@@ -59,6 +60,8 @@ class PolymarketBTCBot:
         self.engine    = AnalysisEngine(TRADING, self.feed, self.funding, self.sentiment)
         self.scanner   = MarketScanner(self.engine, TRADING)
         self.executor  = ExecutionEngine(self.pm, self.risk, self.db, TRADING)
+        self.tg = TelegramBot(API.TELEGRAM_BOT_TOKEN, API.TELEGRAM_CHAT_ID)
+        self.executor.tg = self.tg
 
         self.start_time  = datetime.utcnow()
         self.cycle_count = 0
@@ -96,6 +99,7 @@ class PolymarketBTCBot:
             logger.info(f"Wallet balance: ${balance:.4f}")
 
         logger.info("Bot initialized. Starting main loop...")
+        await self.tg.startup(balance=self.risk.bankroll)
         await self._main_loop()
 
     async def stop(self):
@@ -166,8 +170,9 @@ class PolymarketBTCBot:
     # ─────────────────────────────────────────────────────────────────────
     async def _scan_and_trade(self):
         if self.risk.is_halted:
-            logger.warning(f"Trading halted: {self.risk.halt_reason}")
-            return
+    logger.warning(f"Trading halted: {self.risk.halt_reason}")
+    await self.tg.circuit_breaker(self.risk.halt_reason)
+    return
 
         markets  = self.db.get_active_markets()
         if not markets:
@@ -215,10 +220,18 @@ class PolymarketBTCBot:
             )
 
             trade_uuid = await self.executor.enter_position(sig, size_result)
-            if trade_uuid:
-                logger.info(f"✅ Trade opened: {trade_uuid}")
-            else:
-                logger.warning("Trade execution failed")
+if trade_uuid:
+    logger.info(f"✅ Trade opened: {trade_uuid}")
+    await self.tg.trade_opened({
+        "question":    sig.question,
+        "outcome":     sig.outcome,
+        "size_usdc":   size_result.size_usdc,
+        "entry_price": sig.entry_price,
+        "strategy":    sig.strategy,
+        "ev":          sig.ev,
+    })
+else:
+    logger.warning("Trade execution failed")
 
             # Pause between orders
             await asyncio.sleep(2)
@@ -254,6 +267,15 @@ class PolymarketBTCBot:
         # Progress report
         days = (datetime.utcnow() - self.start_time).days
         logger.info(self.risk.progress_summary(days))
+        
+        await self.tg.daily_summary({
+    "balance":      snap["total_balance"],
+    "daily_pnl":    snap["daily_pnl"],
+    "win_rate":     snap["win_rate"],
+    "total_trades": stats.get("total", 0),
+    "max_drawdown": snap["max_drawdown"],
+    "goal_pct":     (snap["total_balance"] / TRADING.TARGET_BANKROLL) * 100,
+})
 
     def _get_btc_vol(self) -> float:
         ind = self.feed.get_indicators()
