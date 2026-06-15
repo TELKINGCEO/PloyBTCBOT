@@ -22,6 +22,10 @@ from src.analysis.engine import AnalysisEngine, MarketScanner
 from src.risk.risk_manager import RiskManager
 from src.execution.executor import ExecutionEngine
 
+# REPLACE WITH THIS:
+os.makedirs("logs", exist_ok=True)
+os.makedirs("db", exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
