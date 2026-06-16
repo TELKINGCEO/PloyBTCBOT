@@ -1,636 +1,451 @@
 """
-BTC Data Collector - Chainlink Only
-- Chainlink BTC/USD on Polygon (primary, no API key)
-- Chainlink BTC/USD on Ethereum (fallback)
-- CoinGecko REST (final fallback, free)
-- Builds synthetic candles from price polling
-- Calculates all technical indicators
+Polymarket CLOB Client
+- Discover active BTC markets
+- Stream live order book prices
+- Execute buy/sell orders (YES/NO shares)
+- Manage open positions
 """
 import asyncio
 import aiohttp
+import json
 import time
+import hmac
+import hashlib
+import base64
 import logging
-from collections import deque
-from typing import Optional, List, Dict, Tuple, Deque
-import statistics
-import math
+import re
+from datetime import datetime, timezone
+from typing import Optional, List, Dict, Tuple
 
 logger = logging.getLogger(__name__)
 
 
-class RingBuffer:
-    """Fixed-size circular buffer for price data"""
-    def __init__(self, maxlen: int):
-        self._buf: Deque = deque(maxlen=maxlen)
-
-    def append(self, val): self._buf.append(val)
-    def __len__(self):     return len(self._buf)
-    def __iter__(self):    return iter(self._buf)
-    def to_list(self):     return list(self._buf)
-
-    @property
-    def last(self):  return self._buf[-1] if self._buf else None
-    @property
-    def mean(self):  return statistics.mean(self._buf) if self._buf else 0
-    @property
-    def stdev(self): return statistics.stdev(self._buf) if len(self._buf) > 1 else 0
-
-
-class ChainlinkFeed:
+class PolymarketClient:
     """
-    Fetches BTC/USD from Chainlink on-chain oracles.
-    No API key required. Uses free public RPC endpoints.
+    Thin async wrapper around Polymarket CLOB + Gamma APIs.
     """
 
-    # Chainlink BTC/USD on Polygon Mainnet
-    POLYGON_RPC      = "https://polygon-rpc.com"
-    BTC_USD_POLYGON  = "0xc907E116054Ad103354f2D350FD2514433D57F6f"
+    GAMMA_URL = "https://gamma-api.polymarket.com"
+    CLOB_URL  = "https://clob.polymarket.com"
 
-    # Chainlink BTC/USD on Ethereum Mainnet
-    ETH_RPC          = "https://ethereum.publicnode.com"
-    BTC_USD_ETH      = "0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88"
+    def __init__(self, api_key: str = "", secret: str = "",
+                 passphrase: str = "", private_key: str = ""):
+        self.api_key     = api_key
+        self.secret      = secret
+        self.passphrase  = passphrase
+        self.private_key = private_key
+        self._session: Optional[aiohttp.ClientSession] = None
 
-    # latestAnswer() selector
-    LATEST_ANSWER    = "0x50d25bcd"
+        # Cache
+        self._markets_cache: List[Dict] = []
+        self._cache_ts:  float = 0.0
+        self._cache_ttl: float = 60.0
 
-    def __init__(self):
-        self.price:       float = 0.0
-        self.last_update: float = 0.0
-        self.source:      str   = "none"
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if not self._session or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=15)
+            )
+        return self._session
 
-    async def get_price(self) -> float:
-        """Try Polygon → Ethereum → CoinGecko"""
+    def _auth_headers(self, method: str, path: str, body: str = "") -> Dict:
+        if not self.api_key:
+            return {}
+        ts      = str(int(time.time() * 1000))
+        message = ts + method.upper() + path + (body or "")
+        sig     = hmac.new(
+            base64.b64decode(self.secret),
+            message.encode("utf-8"),
+            hashlib.sha256
+        ).digest()
+        signature = base64.b64encode(sig).decode("utf-8")
+        return {
+            "POLY_ADDRESS":    self.api_key,
+            "POLY_SIGNATURE":  signature,
+            "POLY_TIMESTAMP":  ts,
+            "POLY_PASSPHRASE": self.passphrase,
+        }
 
-        # 1. Polygon Chainlink
-        price = await self._call(self.POLYGON_RPC, self.BTC_USD_POLYGON)
-        if price > 1000:
-            self._set(price, "chainlink_polygon")
-            return price
-
-        # 2. Ethereum Chainlink
-        price = await self._call(self.ETH_RPC, self.BTC_USD_ETH)
-        if price > 1000:
-            self._set(price, "chainlink_ethereum")
-            return price
-
-        # 3. CoinGecko free API
-        price = await self._coingecko()
-        if price > 1000:
-            self._set(price, "coingecko")
-            return price
-
-        # Return last known price if all fail
-        logger.warning("All price sources failed — using last known price")
-        return self.price
-
-    def _set(self, price: float, source: str):
-        self.price       = price
-        self.last_update = time.time()
-        self.source      = source
-        logger.debug(f"Price: ${price:,.2f} ({source})")
-
-    async def _call(self, rpc: str, contract: str) -> float:
-        """Call latestAnswer() on a Chainlink contract"""
-        try:
-            payload = {
-                "jsonrpc": "2.0",
-                "method":  "eth_call",
-                "params":  [{"to": contract, "data": self.LATEST_ANSWER}, "latest"],
-                "id":      1,
-            }
-            async with aiohttp.ClientSession() as s:
-                async with s.post(
-                    rpc, json=payload,
-                    timeout=aiohttp.ClientTimeout(total=6)
-                ) as resp:
-                    data = await resp.json()
-
-            result = data.get("result", "0x0")
-            if not result or result in ("0x", "0x0"):
-                return 0.0
-
-            price = int(result, 16) / 1e8   # 8 decimals
-            return price if 1000 < price < 10_000_000 else 0.0
-
-        except Exception as e:
-            logger.debug(f"Chainlink call failed ({rpc}): {e}")
-            return 0.0
-
-    async def _coingecko(self) -> float:
-        """CoinGecko simple price — free, no key"""
-        try:
-            async with aiohttp.ClientSession() as s:
-                async with s.get(
-                    "https://api.coingecko.com/api/v3/simple/price",
-                    params={"ids": "bitcoin", "vs_currencies": "usd"},
-                    timeout=aiohttp.ClientTimeout(total=6),
-                ) as resp:
-                    data = await resp.json()
-            return float(data["bitcoin"]["usd"])
-        except Exception as e:
-            logger.debug(f"CoinGecko failed: {e}")
-            return 0.0
-
-
-class BTCDataFeed:
-    """
-    BTC data feed using Chainlink as sole price source.
-    Polls price every 30 seconds and builds 1-minute OHLCV candles.
-    Calculates full technical indicator suite.
-    """
-
-    POLL_INTERVAL = 30   # seconds between Chainlink polls
-
-    def __init__(self, db=None):
-        self.db        = db
-        self.chainlink = ChainlinkFeed()
-
-        self.current_price: float = 0.0
-        self.last_update:   float = 0.0
-        self.price_source:  str   = "none"
-
-        # Candle data
-        self.candle_1m:  Dict        = {}
-        self.candles_1m: Deque[Dict] = deque(maxlen=500)
-
-        # Price buffers
-        self.closes_1m  = RingBuffer(500)
-        self.highs_1m   = RingBuffer(500)
-        self.lows_1m    = RingBuffer(500)
-        self.volumes_1m = RingBuffer(500)
-
-        # Order flow (approximated from price direction)
-        self.buy_volume_1m:  float = 0.0
-        self.sell_volume_1m: float = 0.0
-
-        # Indicators cache
-        self._indicators:            Dict  = {}
-        self._last_indicator_update: float = 0.0
-
-        # Dummy order book (no exchange)
-        self.bid_price: float = 0.0
-        self.ask_price: float = 0.0
-        self.spread:    float = 0.0
-
-        self._running  = False
-        self._poll_task: Optional[asyncio.Task] = None
+    async def close(self):
+        if self._session:
+            await self._session.close()
 
     # ─────────────────────────────────────────────────────────────────────
-    # Bootstrap
+    # Market discovery — FIXED
     # ─────────────────────────────────────────────────────────────────────
-    async def load_history(self):
+    async def get_btc_hourly_markets(self, force_refresh: bool = False) -> List[Dict]:
         """
-        Get current price from Chainlink then seed 120 synthetic candles
-        so indicators have enough history to initialize.
+        Returns all active BTC markets on Polymarket.
+        Removed overly strict hourly filter — now catches all BTC markets
+        and lets the analysis engine decide which ones to trade.
         """
-        logger.info("Loading BTC price from Chainlink...")
+        now = time.time()
+        if (not force_refresh and self._markets_cache
+                and (now - self._cache_ts) < self._cache_ttl):
+            return self._markets_cache
 
-        price = await self.chainlink.get_price()
-        if price <= 0:
-            price = 67000.0   # hard fallback if everything is down
-            logger.warning(f"Using hardcoded fallback price: ${price:,.2f}")
+        session  = await self._get_session()
+        markets  = []
+        all_raw  = []
 
-        self.current_price = price
-        self.price_source  = self.chainlink.source
-        logger.info(f"BTC price: ${price:,.2f} (source: {self.chainlink.source})")
-
-        # Seed 120 synthetic candles (2 hours of history)
-        self._seed_candles(price, count=120)
-        self._update_indicators()
-
-        logger.info(f"Seeded {len(self.candles_1m)} candles. Ready.")
-
-    def _seed_candles(self, base_price: float, count: int = 120):
-        """Build synthetic flat-line candles for indicator warmup"""
-        now = int(time.time())
-        for i in range(count):
-            ts    = now - (count - i) * 60
-            # tiny noise so stdev doesn't hit zero
-            noise = base_price * 0.0001 * math.sin(i * 0.5)
-            c = {
-                "timestamp": ts,
-                "open":   base_price + noise,
-                "high":   base_price + abs(noise) * 2,
-                "low":    base_price - abs(noise) * 2,
-                "close":  base_price,
-                "volume": 5.0,
-            }
-            self.candles_1m.append(c)
-            self.closes_1m.append(c["close"])
-            self.highs_1m.append(c["high"])
-            self.lows_1m.append(c["low"])
-            self.volumes_1m.append(c["volume"])
-            if self.db:
-                self.db.upsert_candle(
-                    ts, c["open"], c["high"],
-                    c["low"], c["close"], c["volume"])
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Polling loop (replaces WebSocket)
-    # ─────────────────────────────────────────────────────────────────────
-    async def start_streaming(self):
-        self._running   = True
-        self._poll_task = asyncio.create_task(self._poll_loop())
-        logger.info(f"Chainlink polling started (every {self.POLL_INTERVAL}s)")
-
-    async def stop(self):
-        self._running = False
-        if self._poll_task:
-            self._poll_task.cancel()
-
-    async def _poll_loop(self):
-        """Poll Chainlink every 30 seconds and build candles"""
-        while self._running:
-            try:
-                price = await self.chainlink.get_price()
-                if price > 0:
-                    self.current_price = price
-                    self.price_source  = self.chainlink.source
-                    self.last_update   = time.time()
-
-                    # Update order book approximation
-                    self.bid_price = price * 0.9998
-                    self.ask_price = price * 1.0002
-                    self.spread    = self.ask_price - self.bid_price
-
-                    # Build candle tick
-                    self._update_candle(price, volume=1.0)
-
-                    logger.info(
-                        f"BTC ${price:,.2f} | "
-                        f"source={self.chainlink.source} | "
-                        f"candles={len(self.candles_1m)}"
-                    )
-
-            except Exception as e:
-                logger.error(f"Poll error: {e}")
-
-            await asyncio.sleep(self.POLL_INTERVAL)
-
-    def _update_candle(self, price: float, volume: float = 1.0):
-        """Update current 1-minute candle with new price"""
-        ts        = int(time.time())
-        minute_ts = ts - (ts % 60)
-
-        # Approximate buy/sell from price direction
-        prev_price = self.candle_1m.get("close", price)
-        if price >= prev_price:
-            self.buy_volume_1m  += volume
-        else:
-            self.sell_volume_1m += volume
-
-        if not self.candle_1m or self.candle_1m.get("timestamp") != minute_ts:
-            # Close old candle
-            if self.candle_1m:
-                closed = dict(self.candle_1m)
-                self.candles_1m.append(closed)
-                self.closes_1m.append(closed["close"])
-                self.highs_1m.append(closed["high"])
-                self.lows_1m.append(closed["low"])
-                self.volumes_1m.append(closed["volume"])
-                if self.db:
-                    self.db.upsert_candle(
-                        closed["timestamp"], closed["open"], closed["high"],
-                        closed["low"], closed["close"], closed["volume"])
-                self._update_indicators()
-                self.buy_volume_1m  = 0.0
-                self.sell_volume_1m = 0.0
-
-            # Open new candle
-            self.candle_1m = {
-                "timestamp": minute_ts,
-                "open":   price, "high": price,
-                "low":    price, "close": price,
-                "volume": volume,
-            }
-        else:
-            self.candle_1m["high"]    = max(self.candle_1m["high"], price)
-            self.candle_1m["low"]     = min(self.candle_1m["low"],  price)
-            self.candle_1m["close"]   = price
-            self.candle_1m["volume"] += volume
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Technical Indicators
-    # ─────────────────────────────────────────────────────────────────────
-    def _update_indicators(self):
-        closes = self.closes_1m.to_list()
-        highs  = self.highs_1m.to_list()
-        lows   = self.lows_1m.to_list()
-        vols   = self.volumes_1m.to_list()
-        n      = len(closes)
-
-        if n < 10:
-            return
-
-        ind   = {}
-        price = closes[-1]
-
-        # RSI
-        ind["rsi_14"] = self._rsi(closes, 14) if n >= 15 else 50.0
-        ind["rsi_7"]  = self._rsi(closes, 7)  if n >= 8  else 50.0
-
-        # MACD
-        if n >= 27:
-            macd_line, signal_line, histogram = self._macd(closes, 12, 26, 9)
-            ind["macd"]        = macd_line
-            ind["macd_signal"] = signal_line
-            ind["macd_hist"]   = histogram
-            ind["macd_cross"]  = "bullish" if histogram > 0 else "bearish"
-        else:
-            ind["macd"] = ind["macd_signal"] = ind["macd_hist"] = 0.0
-            ind["macd_cross"] = "neutral"
-
-        # Bollinger Bands
-        period = min(20, n)
-        bb_mid, bb_upper, bb_lower = self._bollinger(closes, period, 2.0)
-        ind["bb_mid"]    = bb_mid
-        ind["bb_upper"]  = bb_upper
-        ind["bb_lower"]  = bb_lower
-        ind["bb_pct"]    = ((price - bb_lower) / (bb_upper - bb_lower)
-                            if bb_upper != bb_lower else 0.5)
-        ind["bb_squeeze"] = ((bb_upper - bb_lower) / bb_mid < 0.02
-                             if bb_mid > 0 else False)
-
-        # ATR
-        ind["atr_14"] = self._atr(highs, lows, closes, min(14, n - 1))
-        ind["atr_pct"] = ind["atr_14"] / price if price > 0 else 0
-
-        # EMAs
-        ind["ema_9"]   = self._ema(closes, min(9,   n))
-        ind["ema_21"]  = self._ema(closes, min(21,  n))
-        ind["ema_50"]  = self._ema(closes, min(50,  n))
-        ind["ema_200"] = self._ema(closes, min(200, n))
-        ind["uptrend"]   = (price > ind["ema_9"] > ind["ema_21"]
-                            and n >= 21)
-        ind["downtrend"] = (price < ind["ema_9"] < ind["ema_21"]
-                            and n >= 21)
-
-        # Volume
-        if n >= 5:
-            vol_mean       = statistics.mean(vols[-min(20, n):])
-            ind["vol_ratio"] = vols[-1] / vol_mean if vol_mean else 1.0
-            ind["vol_spike"] = ind["vol_ratio"] > 2.0
-
-        # Momentum (safe window checks)
-        ind["roc_5"]  = (closes[-1] / closes[-6]  - 1) * 100 if n >= 6  else 0.0
-        ind["roc_10"] = (closes[-1] / closes[-11] - 1) * 100 if n >= 11 else 0.0
-        ind["roc_30"] = (closes[-1] / closes[-31] - 1) * 100 if n >= 31 else 0.0
-
-        # Stochastic
-        if n >= 14:
-            h14 = max(highs[-14:])
-            l14 = min(lows[-14:])
-            ind["stoch_k"] = ((price - l14) / (h14 - l14) * 100
-                              if h14 != l14 else 50.0)
-        else:
-            ind["stoch_k"] = 50.0
-
-        # OBV
-        ind["obv_trend"] = self._obv_trend(closes, vols)
-
-        # Hourly volatility — FIXED: use index range, not negative indices
-        vol_window = min(60, n)
-        if vol_window >= 10:
-            start = n - vol_window
-            hourly_returns = []
-            for i in range(start + 1, n):
-                if closes[i - 1] > 0 and closes[i] > 0:
-                    try:
-                        hourly_returns.append(
-                            math.log(closes[i] / closes[i - 1]))
-                    except (ValueError, ZeroDivisionError):
-                        continue
-            if len(hourly_returns) > 1:
-                ind["hourly_vol"] = (statistics.stdev(hourly_returns)
-                                     * math.sqrt(60))
-            else:
-                ind["hourly_vol"] = 0.01
-        else:
-            ind["hourly_vol"] = 0.01
-
-        # Market structure
-        if n >= 20:
-            swing_highs = self._swing_highs(highs[-20:], 3)
-            swing_lows  = self._swing_lows(lows[-20:],   3)
-            ind["higher_highs"] = (len(swing_highs) >= 2 and
-                                   swing_highs[-1] > swing_highs[-2])
-            ind["lower_lows"]   = (len(swing_lows)  >= 2 and
-                                   swing_lows[-1]  < swing_lows[-2])
-        else:
-            ind["higher_highs"] = False
-            ind["lower_lows"]   = False
-
-        # Order flow (approximated)
-        total = self.buy_volume_1m + self.sell_volume_1m
-        ind["delta_ratio"] = (
-            (self.buy_volume_1m - self.sell_volume_1m) / total
-            if total > 0 else 0.0
-        )
-
-        # Metadata
-        ind["price"]            = price
-        ind["price_source"]     = self.price_source
-        ind["chainlink_source"] = self.chainlink.source
-        ind["timestamp"]        = int(time.time())
-
-        self._indicators            = ind
-        self._last_indicator_update = time.time()
-
-    def get_indicators(self) -> Dict:
-        if time.time() - self._last_indicator_update > 120:
-            self._update_indicators()
-        return dict(self._indicators)
-
-    def get_price(self) -> float:
-        return self.current_price
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Indicator math helpers
-    # ─────────────────────────────────────────────────────────────────────
-    @staticmethod
-    def _ema(series: List[float], period: int) -> float:
-        if not series or period <= 0:
-            return series[-1] if series else 0.0
-        period = min(period, len(series))
-        k      = 2.0 / (period + 1)
-        ema    = sum(series[:period]) / period
-        for p in series[period:]:
-            ema = p * k + ema * (1 - k)
-        return ema
-
-    @staticmethod
-    def _rsi(closes: List[float], period: int = 14) -> float:
-        if len(closes) < period + 1:
-            return 50.0
-        gains, losses = [], []
-        for i in range(1, len(closes)):
-            diff = closes[i] - closes[i - 1]
-            gains.append(max(diff, 0))
-            losses.append(max(-diff, 0))
-        avg_gain = sum(gains[-period:]) / period
-        avg_loss = sum(losses[-period:]) / period
-        if avg_loss == 0:
-            return 100.0
-        return 100 - (100 / (1 + avg_gain / avg_loss))
-
-    def _macd(self, closes: List[float], fast: int, slow: int,
-              signal: int) -> Tuple[float, float, float]:
-        ema_fast  = self._ema(closes, fast)
-        ema_slow  = self._ema(closes, slow)
-        macd_line = ema_fast - ema_slow
-        macd_series = []
-        for i in range(signal, len(closes) + 1):
-            ef = self._ema(closes[:i], fast)
-            es = self._ema(closes[:i], slow)
-            macd_series.append(ef - es)
-        signal_line = (self._ema(macd_series, signal)
-                       if len(macd_series) >= signal else macd_line)
-        return macd_line, signal_line, macd_line - signal_line
-
-    @staticmethod
-    def _bollinger(closes: List[float], period: int,
-                   std_mult: float) -> Tuple[float, float, float]:
-        if len(closes) < 2:
-            p = closes[-1] if closes else 0
-            return p, p, p
-        window = closes[-period:]
-        mid    = statistics.mean(window)
-        std    = statistics.stdev(window) if len(window) > 1 else 0
-        return mid, mid + std_mult * std, mid - std_mult * std
-
-    @staticmethod
-    def _atr(highs: List[float], lows: List[float],
-             closes: List[float], period: int) -> float:
-        if len(closes) < 2 or period <= 0:
-            return 0.0
-        trs = []
-        for i in range(1, len(closes)):
-            hl  = highs[i]  - lows[i]
-            hpc = abs(highs[i]  - closes[i - 1])
-            lpc = abs(lows[i]   - closes[i - 1])
-            trs.append(max(hl, hpc, lpc))
-        return statistics.mean(trs[-period:]) if trs else 0.0
-
-    @staticmethod
-    def _obv_trend(closes: List[float], volumes: List[float]) -> str:
-        if len(closes) < 5:
-            return "neutral"
-        obv, series = 0, [0]
-        for i in range(1, min(len(closes), len(volumes))):
-            if   closes[i] > closes[i - 1]: obv += volumes[i]
-            elif closes[i] < closes[i - 1]: obv -= volumes[i]
-            series.append(obv)
-        if len(series) >= 5:
-            if series[-1] > series[-5]: return "bullish"
-            if series[-1] < series[-5]: return "bearish"
-        return "neutral"
-
-    @staticmethod
-    def _swing_highs(highs: List[float], window: int) -> List[float]:
-        return [highs[i] for i in range(window, len(highs) - window)
-                if highs[i] == max(highs[i - window:i + window + 1])]
-
-    @staticmethod
-    def _swing_lows(lows: List[float], window: int) -> List[float]:
-        return [lows[i] for i in range(window, len(lows) - window)
-                if lows[i] == min(lows[i - window:i + window + 1])]
-
-
-# ─────────────────────────────────────────────────────────────────────────
-class FundingRateCollector:
-    """
-    Funding rate via Bybit public API (not geo-blocked like Binance).
-    Falls back to neutral values gracefully.
-    """
-
-    def __init__(self):
-        self.funding_rate:     float = 0.0
-        self.open_interest:    float = 0.0
-        self.long_short_ratio: float = 1.0
-        self.last_update:      float = 0.0
-
-    async def update(self):
         try:
-            async with aiohttp.ClientSession() as s:
-                # Bybit funding rate (public, no key needed)
-                async with s.get(
-                    "https://api.bybit.com/v5/market/tickers",
-                    params={"category": "linear", "symbol": "BTCUSDT"},
-                    timeout=aiohttp.ClientTimeout(total=6),
-                ) as resp:
-                    data = await resp.json()
-                    items = (data.get("result", {})
-                                 .get("list", []))
-                    if items:
-                        self.funding_rate = float(
-                            items[0].get("fundingRate", 0))
-                        self.open_interest = float(
-                            items[0].get("openInterest", 0))
+            # ── Fetch from Gamma API ──────────────────────────────────────
+            # Try multiple search terms to catch all BTC markets
+            search_terms = ["bitcoin", "BTC"]
 
-                self.last_update = time.time()
-        except Exception as e:
-            logger.debug(f"Funding rate fetch failed: {e}")
-
-    def get_bias(self) -> float:
-        funding_bias = -math.tanh(self.funding_rate * 100)
-        ls_bias      = math.tanh(
-            math.log(max(self.long_short_ratio, 0.01)) * 0.5)
-        return (funding_bias + ls_bias) / 2
-
-
-# ─────────────────────────────────────────────────────────────────────────
-class SentimentCollector:
-    """Fear & Greed index + optional CryptoPanic news sentiment"""
-
-    def __init__(self, cryptopanic_key: str = ""):
-        self.fear_greed:       float     = 50.0
-        self.news_sentiment:   float     = 0.0
-        self.cryptopanic_key:  str       = cryptopanic_key
-        self.last_update:      float     = 0.0
-        self.recent_headlines: List[str] = []
-
-    async def update(self):
-        try:
-            async with aiohttp.ClientSession() as s:
-                # Fear & Greed (always free)
-                async with s.get(
-                    "https://api.alternative.me/fng/?limit=1",
-                    timeout=aiohttp.ClientTimeout(total=6),
-                ) as resp:
-                    data = await resp.json()
-                    if data.get("data"):
-                        self.fear_greed = float(data["data"][0]["value"])
-
-                # CryptoPanic (optional)
-                if self.cryptopanic_key:
-                    url = (
-                        f"https://cryptopanic.com/api/v1/posts/"
-                        f"?auth_token={self.cryptopanic_key}"
-                        f"&currencies=BTC&public=true&kind=news&limit=10"
-                    )
-                    async with s.get(
-                        url, timeout=aiohttp.ClientTimeout(total=6)
+            for term in search_terms:
+                params = {
+                    "active":  "true",
+                    "closed":  "false",
+                    "limit":   "100",
+                    "order":   "volume",
+                    "search":  term,
+                }
+                try:
+                    async with session.get(
+                        f"{self.GAMMA_URL}/markets",
+                        params=params,
+                        timeout=aiohttp.ClientTimeout(total=10)
                     ) as resp:
-                        data = await resp.json()
-                        sentiments, self.recent_headlines = [], []
-                        for item in data.get("results", []):
-                            votes = item.get("votes", {})
-                            pos   = votes.get("positive", 0)
-                            neg   = votes.get("negative", 0)
-                            self.recent_headlines.append(
-                                item.get("title", ""))
-                            if pos + neg > 0:
-                                sentiments.append(
-                                    (pos - neg) / (pos + neg))
-                        self.news_sentiment = (
-                            statistics.mean(sentiments)
-                            if sentiments else 0.0)
+                        if resp.status == 200:
+                            data = await resp.json()
+                            raw  = (data if isinstance(data, list)
+                                    else data.get("markets", []))
+                            all_raw.extend(raw)
+                            logger.debug(
+                                f"Gamma search '{term}': {len(raw)} results")
+                except Exception as e:
+                    logger.debug(f"Gamma search '{term}' failed: {e}")
 
-                self.last_update = time.time()
+            # Also try without search term (get all active markets)
+            try:
+                params = {
+                    "active": "true",
+                    "closed": "false",
+                    "limit":  "200",
+                    "order":  "volume",
+                }
+                async with session.get(
+                    f"{self.GAMMA_URL}/markets",
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as resp:
+                    if resp.status == 200:
+                        data    = await resp.json()
+                        raw     = (data if isinstance(data, list)
+                                   else data.get("markets", []))
+                        all_raw.extend(raw)
+                        logger.debug(f"Gamma all markets: {len(raw)} results")
+            except Exception as e:
+                logger.debug(f"Gamma all-markets fetch failed: {e}")
+
+            # ── Deduplicate by market ID ──────────────────────────────────
+            seen   = set()
+            unique = []
+            for m in all_raw:
+                mid = m.get("id") or m.get("conditionId", "")
+                if mid and mid not in seen:
+                    seen.add(mid)
+                    unique.append(m)
+
+            logger.debug(f"Total unique markets from API: {len(unique)}")
+
+            # ── Filter for BTC markets ────────────────────────────────────
+            for m in unique:
+                q    = (m.get("question")    or "").lower()
+                desc = (m.get("description") or "").lower()
+                tags = [t.lower() for t in (m.get("tags") or [])]
+
+                # BTC check — broad to catch all variations
+                is_btc = (
+                    "bitcoin" in q or "btc" in q or
+                    "bitcoin" in desc or "btc" in desc or
+                    any("bitcoin" in t or "btc" in t for t in tags)
+                )
+
+                if not is_btc:
+                    continue
+
+                # Active check — Polymarket uses different field names
+                is_active = (
+                    m.get("active") is True or
+                    m.get("active") == "true" or
+                    m.get("isActive") is True or
+                    m.get("closed") is False or
+                    m.get("closed") == "false" or
+                    m.get("status", "").lower() == "active"
+                )
+
+                # Skip clearly closed/resolved markets
+                if m.get("resolved") or m.get("isResolved"):
+                    continue
+
+                # Extract end time
+                end_ts  = 0
+                end_str = (m.get("endDate") or m.get("end_date_iso") or
+                           m.get("endDateIso") or m.get("end_date") or "")
+                if end_str:
+                    try:
+                        dt     = datetime.fromisoformat(
+                            end_str.replace("Z", "+00:00"))
+                        end_ts = int(dt.timestamp())
+                    except Exception:
+                        pass
+
+                # If no end time found, try unix timestamp fields
+                if end_ts == 0:
+                    end_ts = int(m.get("endTimestamp", 0) or
+                                 m.get("end_timestamp", 0) or 0)
+
+                time_to_expiry = end_ts - int(now) if end_ts > 0 else 0
+
+                # WIDENED window: include markets expiring in next 24 hours
+                # (previously was 4 hours — too narrow)
+                if end_ts > 0 and time_to_expiry < 0:
+                    continue  # Already expired
+
+                # Include market regardless of is_active if it has a future end time
+                # or if is_active is True
+                if not is_active and time_to_expiry <= 0:
+                    continue
+
+                markets.append({
+                    "id":             m.get("id", "") or m.get("conditionId", ""),
+                    "condition_id":   m.get("conditionId", ""),
+                    "question":       m.get("question", ""),
+                    "outcomes":       json.dumps(
+                        m.get("outcomes", ["YES", "NO"])),
+                    "outcome_prices": json.dumps(self._extract_prices(m)),
+                    "volume":         float(m.get("volume",    0) or 0),
+                    "liquidity":      float(m.get("liquidity", 0) or 0),
+                    "end_time":       end_ts,
+                    "start_time":     0,
+                    "market_type":    "btc_hourly",
+                    "time_to_expiry": max(0, time_to_expiry),
+                    "raw":            m,
+                })
+
+            # Sort by soonest expiry first (most urgent opportunities)
+            markets.sort(key=lambda x: x["end_time"] if x["end_time"] > 0
+                         else float("inf"))
+
+            logger.info(
+                f"Found {len(markets)} active BTC markets "
+                f"(from {len(unique)} total unique markets scanned)"
+            )
+
+            # Log market titles for debugging
+            for mkt in markets[:5]:
+                logger.info(
+                    f"  Market: {mkt['question'][:70]} "
+                    f"| TTX: {mkt['time_to_expiry']//60}min "
+                    f"| Vol: ${mkt['volume']:.0f}"
+                )
+
         except Exception as e:
-            logger.debug(f"Sentiment fetch failed: {e}")
+            logger.error(f"Market fetch error: {e}", exc_info=True)
+            return self._markets_cache
 
-    def get_score(self) -> float:
-        fg_score = (self.fear_greed - 50) / 50
-        combined = fg_score * 0.4 + self.news_sentiment * 0.6
-        return max(-1.0, min(1.0, combined))
+        self._markets_cache = markets
+        self._cache_ts      = now
+        return markets
+
+    def _extract_prices(self, market: Dict) -> List[float]:
+        """Extract YES/NO prices from market data"""
+        # Try tokens array first
+        tokens = market.get("tokens") or []
+        if tokens:
+            prices = []
+            for t in tokens:
+                p = t.get("price")
+                if p is not None:
+                    try:
+                        prices.append(float(p))
+                    except (ValueError, TypeError):
+                        pass
+            if len(prices) >= 2:
+                return prices[:2]
+
+        # Try outcomePrices
+        op = market.get("outcomePrices") or []
+        if op:
+            try:
+                prices = [float(p) for p in op]
+                if len(prices) >= 2:
+                    return prices[:2]
+            except Exception:
+                pass
+
+        # Try bestBid/bestAsk
+        bid = market.get("bestBid")
+        ask = market.get("bestAsk")
+        if bid is not None:
+            try:
+                yes_price = float(bid)
+                return [yes_price, round(1.0 - yes_price, 4)]
+            except Exception:
+                pass
+
+        return [0.5, 0.5]
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Order book
+    # ─────────────────────────────────────────────────────────────────────
+    async def get_orderbook(self, token_id: str) -> Dict:
+        session = await self._get_session()
+        try:
+            async with session.get(
+                f"{self.CLOB_URL}/book",
+                params={"token_id": token_id},
+                headers=self._auth_headers("GET", "/book")
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+        except Exception as e:
+            logger.debug(f"Order book fetch error: {e}")
+        return {"bids": [], "asks": []}
+
+    async def get_market_price(self, market_id: str) -> Tuple[float, float]:
+        """Return (yes_price, no_price) for a market"""
+        session = await self._get_session()
+        try:
+            async with session.get(
+                f"{self.GAMMA_URL}/markets/{market_id}",
+                timeout=aiohttp.ClientTimeout(total=8)
+            ) as resp:
+                if resp.status == 200:
+                    m      = await resp.json()
+                    prices = self._extract_prices(m)
+                    if len(prices) >= 2:
+                        return prices[0], prices[1]
+                    if len(prices) == 1:
+                        return prices[0], round(1.0 - prices[0], 4)
+        except Exception as e:
+            logger.debug(f"Price fetch error for {market_id}: {e}")
+        return 0.5, 0.5
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Order execution
+    # ─────────────────────────────────────────────────────────────────────
+    async def place_order(self, token_id: str, side: str, size: float,
+                          price: float, order_type: str = "GTC") -> Optional[Dict]:
+        # Paper trading mode
+        if not self.api_key:
+            return self._simulate_fill(token_id, side, size, price)
+
+        # Live trading
+        session = await self._get_session()
+        shares  = size / price if price > 0 else 0
+        body    = json.dumps({
+            "tokenID": token_id,
+            "side":    side.upper(),
+            "type":    order_type,
+            "size":    str(round(shares, 2)),
+            "price":   str(round(price, 4)),
+        })
+        try:
+            headers = self._auth_headers("POST", "/order", body)
+            async with session.post(
+                f"{self.CLOB_URL}/order",
+                data=body, headers=headers
+            ) as resp:
+                data = await resp.json()
+                if resp.status == 200 and data.get("success"):
+                    logger.info(
+                        f"Order placed: {side} {shares:.2f} @ {price:.4f}")
+                    return data
+                else:
+                    logger.error(f"Order failed: {data}")
+                    return None
+        except Exception as e:
+            logger.error(f"Order execution error: {e}")
+            return None
+
+    def _simulate_fill(self, token_id: str, side: str,
+                       size: float, price: float) -> Dict:
+        """Paper trading simulation with 0.1% slippage"""
+        slippage   = 0.001
+        fill_price = (price * (1 + slippage) if side == "BUY"
+                      else price * (1 - slippage))
+        fill_price = max(0.01, min(0.99, fill_price))
+        shares     = size / fill_price
+        return {
+            "orderId":    f"PAPER_{int(time.time() * 1000)}",
+            "status":     "FILLED",
+            "fillPrice":  fill_price,
+            "fillSize":   shares,
+            "size_usdc":  size,
+            "paper_trade": True,
+        }
+
+    async def cancel_order(self, order_id: str) -> bool:
+        if not self.api_key or order_id.startswith("PAPER_"):
+            return True
+        session = await self._get_session()
+        try:
+            headers = self._auth_headers("DELETE", f"/order/{order_id}")
+            async with session.delete(
+                f"{self.CLOB_URL}/order/{order_id}",
+                headers=headers
+            ) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Balance
+    # ─────────────────────────────────────────────────────────────────────
+    async def get_balance(self) -> float:
+        if not self.api_key:
+            return 10.0   # Paper trading balance
+        session = await self._get_session()
+        try:
+            headers = self._auth_headers("GET", "/balance")
+            async with session.get(
+                f"{self.CLOB_URL}/balance", headers=headers
+            ) as resp:
+                data = await resp.json()
+                return float(data.get("balance", 0))
+        except Exception as e:
+            logger.error(f"Balance fetch error: {e}")
+            return 0.0
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Parsing helpers
+    # ─────────────────────────────────────────────────────────────────────
+    @staticmethod
+    def parse_btc_target(question: str) -> Optional[float]:
+        """Extract BTC price target from market question"""
+        patterns = [
+            r'\$([0-9,]+(?:\.[0-9]+)?)',
+            r'(\d{2,3},\d{3}(?:\.[0-9]+)?)',
+            r'above\s+(\d+)',
+            r'below\s+(\d+)',
+            r'at\s+\$?(\d+)',
+            r'(\d{5,6}(?:\.\d+)?)',   # bare 5-6 digit number (BTC price range)
+        ]
+        clean = question.replace(",", "")
+        for pattern in patterns:
+            match = re.search(pattern, clean, re.IGNORECASE)
+            if match:
+                try:
+                    val = float(match.group(1).replace(",", ""))
+                    # Sanity check: BTC price between $10k and $1M
+                    if 10_000 < val < 1_000_000:
+                        return val
+                except Exception:
+                    continue
+        return None
+
+    @staticmethod
+    def market_direction(question: str) -> str:
+        """Return 'above' or 'below'"""
+        q = question.lower()
+        if any(w in q for w in ["above", "higher", "exceed", "over",
+                                  "up", "rise", "rally", "surpass"]):
+            return "above"
+        if any(w in q for w in ["below", "lower", "under", "drop",
+                                  "fall", "decline", "crash"]):
+            return "below"
+        return "above"   # default
