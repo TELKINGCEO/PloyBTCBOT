@@ -284,40 +284,33 @@ class PolymarketBTCBot:
             logger.debug("No active markets available")
             return
 
-        logger.info(f"Scanning {len(all_markets)} markets for signals...")
+        # Fetch live prices for each market before scanning
+        import json as _json
+        enriched = []
+        for m in all_markets:
+            market_id = m.get("id", "")
+            # Only fetch if prices look like default [0.5, 0.5]
+            try:
+                existing = _json.loads(m.get("outcome_prices", "[0.5,0.5]"))
+                needs_price = (not existing or
+                               abs(existing[0] - 0.5) < 0.01)
+            except Exception:
+                needs_price = True
 
-        # Debug: log what the engine sees for each market
-        for m in all_markets[:5]:
-            ind   = self.engine.feed.get_indicators()
-            mtype = m.get("market_type", "MISSING")
-            tte   = m.get("time_to_expiry", 0)
-            prices = m.get("outcome_prices", "[0.5,0.5]")
-            logger.info(
-                f"  MARKET: type={mtype} tte={tte//60}min "
-                f"prices={prices} q={m.get('question','')[:40]}"
-            )
+            if needs_price and market_id:
+                try:
+                    up_p, dn_p = await self.pm.get_market_price(market_id)
+                    m = dict(m)
+                    m["outcome_prices"] = _json.dumps([up_p, dn_p])
+                except Exception:
+                    pass
+            enriched.append(m)
 
-        signals = self.scanner.scan(all_markets)
+        logger.info(f"Scanning {len(enriched)} markets for signals...")
+        signals = self.scanner.scan(enriched)
 
         if not signals:
-            logger.info("No actionable signals — checking why...")
-            for m in all_markets[:3]:
-                try:
-                    sig = self.engine.analyze_market(m)
-                    if sig is None:
-                        logger.info(
-                            f"  SKIP (None): {m.get('question','')[:50]} "
-                            f"type={m.get('market_type','?')}"
-                        )
-                    else:
-                        logger.info(
-                            f"  BLOCKED: {m.get('question','')[:40]} "
-                            f"edge={sig.edge*100:.1f}% ev={sig.ev*100:.1f}c "
-                            f"conf={sig.confidence*100:.0f}% "
-                            f"tte={sig.time_to_expiry//60:.0f}min"
-                        )
-                except Exception as e:
-                    logger.info(f"  ERROR: {m.get('question','')[:40]} — {e}")
+            logger.debug("No actionable signals this cycle")
             return
 
         logger.info(f"Found {len(signals)} signal(s) this cycle")
