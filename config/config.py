@@ -20,8 +20,8 @@ class TradingConfig:
     MAX_KELLY_BET: float = 0.30         # Hard cap at 30% even if Kelly says more
     
     # EV Thresholds
-    MIN_EDGE_PCT: float = 0.03          # Minimum 3% edge to enter
-    MIN_EV: float = 0.02                # Minimum 2 cents EV per dollar risked
+    MIN_EDGE_PCT: float = 0.015   # Lowered: 1.5% edge minimum          # Minimum 3% edge to enter
+    MIN_EV: float = 0.01          # Lowered: 1% EV minimum                # Minimum 2 cents EV per dollar risked
     MIN_CONFIDENCE: float = 0.55        # Minimum 55% model confidence
     
     # Exit Conditions
@@ -61,8 +61,6 @@ class APIConfig:
     # Alternative Data
     FEAR_GREED_URL: str = "https://api.alternative.me/fng/"
     GLASSNODE_API_KEY: str = os.getenv("GLASSNODE_API_KEY", "")
-    TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    TELEGRAM_CHAT_ID:   str = os.getenv("TELEGRAM_CHAT_ID", "")
 
 @dataclass
 class DatabaseConfig:
