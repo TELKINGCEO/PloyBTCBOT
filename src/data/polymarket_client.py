@@ -159,58 +159,23 @@ class PolymarketClient:
             if m.get("resolved") or m.get("isResolved"):
                 continue
 
-            # ── Detect 15-minute market ───────────────────────────────────
-            # Pattern: "Bitcoin Up or Down - June 17, 2:00AM-2:15AM ET"
-            # The time range spans exactly 5 or 15 minutes
-            is_15min = False
-            if "up or down" in q and "bitcoin" in q:
-                # Check time range pattern like "2:00am-2:15am"
-                time_range = re.findall(
-                    r'(\d{1,2}:\d{2}(?:am|pm)?)-(\d{1,2}:\d{2}(?:am|pm)?)',
-                    q, re.IGNORECASE)
-                if time_range:
-                    is_15min = True
-                else:
-                    # Also match if it just says "up or down" with bitcoin
-                    is_15min = True
+            # Detect 15-minute market
+            # Core name never changes: "BTC Up or Down 15m"
+            # Only the date/time suffix changes each cycle
+            is_15min = (
+                "btc" in q and
+                "up or down" in q and
+                "15m" in q
+            )
 
-            # ── Detect 1-hour market ──────────────────────────────────────
-            # Pattern: "Bitcoin above $67,000 on June 17?"
-            # Pattern: "Will Bitcoin be above $X at Y:00?"
-            # Pattern: "Bitcoin above ___ on June 17?"
-            is_1hour = False
-            if "bitcoin" in q or "btc" in q:
-                hour_indicators = [
-                    "above" in q and ("on june" in q or "on july" in q or
-                                      "on aug" in q or "today" in q or
-                                      "tomorrow" in q or re.search(
-                                          r'on \w+ \d+', q)),
-                    "below" in q and ("on june" in q or "on july" in q or
-                                      re.search(r'on \w+ \d+', q)),
-                    "will bitcoin" in q and "above" in q,
-                    "will bitcoin" in q and "below" in q,
-                    "will btc" in q and "above" in q,
-                    "will btc" in q and "below" in q,
-                    # "Bitcoin above ___ on June 17?"
-                    bool(re.search(
-                        r'bitcoin\s+(above|below|exceed|hit|reach)',
-                        q, re.IGNORECASE)),
-                ]
-                is_1hour = any(hour_indicators)
-                # But exclude if it's a 15min "up or down" market
-                if is_15min:
-                    is_1hour = False
-                # Exclude multi-day/weekly/monthly markets
-                long_term = [
-                    "2026", "2027", "year", "month", "week",
-                    "january", "february", "march", "april", "may",
-                    "q1", "q2", "q3", "q4", "annual", "halving",
-                    "microstrategy", "etf", "regulation", "sec",
-                    "election", "president", "senator",
-                ]
-                if any(lt in q for lt in long_term):
-                    is_1hour = False
-
+            # Detect 1-hour market
+            # Core name never changes: "BTC Up or Down Hourly"
+            # Only the date/time suffix changes each cycle
+            is_1hour = (
+                "btc" in q and
+                "up or down" in q and
+                "hourly" in q
+            )
             if not is_15min and not is_1hour:
                 continue
 
