@@ -3,6 +3,7 @@ Main Bot - Async orchestration loop
 Coordinates: data feed → analysis → risk → execution → monitoring
 """
 import asyncio
+import aiohttp
 import time
 import json
 import logging
@@ -13,6 +14,9 @@ from datetime import datetime, timezone
 # ── Path setup ────────────────────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+os.makedirs("logs", exist_ok=True)
+os.makedirs("db", exist_ok=True)
+
 from config.config import TRADING, API, DATABASE, MODEL
 from src.utils.database import Database
 from src.utils.telegram_bot import TelegramBot
@@ -21,10 +25,6 @@ from src.data.polymarket_client import PolymarketClient
 from src.analysis.engine import AnalysisEngine, MarketScanner
 from src.risk.risk_manager import RiskManager
 from src.execution.executor import ExecutionEngine
-
-# REPLACE WITH THIS:
-os.makedirs("logs", exist_ok=True)
-os.makedirs("db", exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,10 +42,10 @@ class PolymarketBTCBot:
     Main bot controller.
 
     Loop cadence:
-      - Every 1m  : update BTC indicators (via streaming)
       - Every 2m  : scan for new market opportunities
       - Every 30s : monitor open positions for exit
       - Every 5m  : update sentiment + funding
+      - Every 90s : refresh market list
       - Every 1h  : snapshot portfolio, check progress
     """
 
@@ -70,7 +70,6 @@ class PolymarketBTCBot:
         self.start_time  = datetime.utcnow()
         self.cycle_count = 0
         self._running    = False
-
         self._analyzed_markets: set = set()
 
     # ─────────────────────────────────────────────────────────────────────
@@ -79,8 +78,8 @@ class PolymarketBTCBot:
     async def start(self):
         logger.info("=" * 60)
         logger.info("  Polymarket BTC Trading Bot Starting")
-        logger.info(f"  Target: ${TRADING.INITIAL_BANKROLL:.2f} → ${TRADING.TARGET_BANKROLL:.0f} "
-                    f"in {TRADING.TARGET_DAYS} days")
+        logger.info(f"  Target: ${TRADING.INITIAL_BANKROLL:.2f} → "
+                    f"${TRADING.TARGET_BANKROLL:.0f} in {TRADING.TARGET_DAYS} days")
         logger.info("=" * 60)
 
         await self.feed.load_history()
@@ -100,7 +99,10 @@ class PolymarketBTCBot:
 
         logger.info("Bot initialized. Starting main loop...")
         await self.tg.startup(balance=self.risk.bankroll)
+
+        # Start Telegram command polling as background task
         asyncio.create_task(self._poll_telegram_commands())
+
         await self._main_loop()
 
     async def stop(self):
@@ -108,6 +110,103 @@ class PolymarketBTCBot:
         await self.feed.stop()
         await self.pm.close()
         logger.info("Bot stopped.")
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Telegram command polling  ← INSIDE the class now
+    # ─────────────────────────────────────────────────────────────────────
+    async def _poll_telegram_commands(self):
+        """Listen for /status, /balance, /stop commands from user"""
+        offset = 0
+        while self._running:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        f"https://api.telegram.org/bot"
+                        f"{API.TELEGRAM_BOT_TOKEN}/getUpdates",
+                        params={"offset": offset, "timeout": 10},
+                        timeout=aiohttp.ClientTimeout(total=15)
+                    ) as resp:
+                        data = await resp.json()
+
+                    for update in data.get("result", []):
+                        offset = update["update_id"] + 1
+                        text   = (update.get("message", {})
+                                        .get("text", "")).strip().lower()
+
+                        if text == "/status":
+                            await self._send_status()
+                        elif text == "/balance":
+                            state = self.risk.get_state()
+                            await self.tg.send(
+                                f"💵 <b>Balance:</b> ${state['bankroll']:.2f}\n"
+                                f"📈 <b>P&L:</b> ${state['total_pnl']:+.2f}\n"
+                                f"📊 <b>Open trades:</b> "
+                                f"{state['open_positions']}"
+                            )
+                        elif text == "/trades":
+                            await self._send_open_trades()
+                        elif text == "/stop":
+                            await self.tg.send("🛑 Bot stopping...")
+                            self._running = False
+
+            except Exception as e:
+                logger.debug(f"Telegram poll error: {e}")
+
+            await asyncio.sleep(5)
+
+    async def _send_status(self):
+        """Send full status to Telegram"""
+        open_trades = self.executor.get_open_positions_summary()
+        state       = self.risk.get_state()
+        stats       = self.db.get_trade_stats()
+        n           = stats.get("total", 0)
+        wins        = stats.get("wins",  0)
+        wr          = f"{wins/n*100:.1f}%" if n else "—"
+
+        msg = (
+            f"📊 <b>BOT STATUS</b>\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"💵 Balance: <b>${state['bankroll']:.2f}</b>\n"
+            f"📈 Total P&L: <b>${state['total_pnl']:+.2f}</b>\n"
+            f"📉 Daily P&L: <b>${state['daily_pnl']:+.2f}</b>\n"
+            f"🏆 Win Rate: {wr} ({n} trades)\n"
+            f"📊 Open Positions: {len(open_trades)}\n"
+            f"💹 BTC: ${self.feed.get_price():,.0f}\n"
+        )
+
+        if open_trades:
+            msg += "\n<b>Open Trades:</b>\n"
+            for t in open_trades:
+                msg += (
+                    f"  • <b>{t['outcome']}</b> "
+                    f"{t['question'][:45]}...\n"
+                    f"    ${t['size_usdc']:.2f} @ "
+                    f"{t['entry_price']:.4f} | "
+                    f"{t['hold_minutes']:.0f}m held\n"
+                )
+        else:
+            msg += "\nNo open positions."
+
+        await self.tg.send(msg)
+
+    async def _send_open_trades(self):
+        """Send open trades list to Telegram"""
+        open_trades = self.executor.get_open_positions_summary()
+        if not open_trades:
+            await self.tg.send("📭 No open trades right now.")
+            return
+
+        msg = f"📋 <b>OPEN TRADES ({len(open_trades)})</b>\n━━━━━━━━━━━━━━━\n"
+        for i, t in enumerate(open_trades, 1):
+            msg += (
+                f"{i}. <b>{t['outcome']}</b> | {t['strategy']}\n"
+                f"   {t['question'][:50]}...\n"
+                f"   Size: ${t['size_usdc']:.2f} | "
+                f"Entry: {t['entry_price']:.4f}\n"
+                f"   Held: {t['hold_minutes']:.0f}min | "
+                f"Expires in: {t['expiry_in']:.0f}min\n\n"
+            )
+        await self.tg.send(msg)
 
     # ─────────────────────────────────────────────────────────────────────
     # Main loop
@@ -132,11 +231,13 @@ class PolymarketBTCBot:
                     last_sentiment = now
 
                 if now - last_market_refresh > 90:
-                    markets = await self.pm.get_btc_hourly_markets(force_refresh=True)
+                    markets = await self.pm.get_btc_hourly_markets(
+                        force_refresh=True)
                     for m in markets:
                         self.db.upsert_market(m)
                     last_market_refresh = now
-                    logger.info(f"Markets refreshed: {len(markets)} active BTC markets")
+                    logger.info(
+                        f"Markets refreshed: {len(markets)} active BTC markets")
 
                 if now - last_monitor > 30:
                     btc_vol = self._get_btc_vol()
@@ -154,7 +255,7 @@ class PolymarketBTCBot:
                 await asyncio.sleep(5)
 
             except KeyboardInterrupt:
-                logger.info("Keyboard interrupt received. Shutting down...")
+                logger.info("Keyboard interrupt. Shutting down...")
                 break
             except Exception as e:
                 logger.error(f"Main loop error: {e}", exc_info=True)
@@ -188,7 +289,6 @@ class PolymarketBTCBot:
             return
 
         logger.info(f"Found {len(signals)} signal(s) this cycle")
-
         btc_vol = self._get_btc_vol()
 
         for sig in signals:
@@ -197,17 +297,17 @@ class PolymarketBTCBot:
                 continue
 
             size_result = self.risk.check_trade(sig, btc_vol)
-
             if not size_result.allowed:
                 logger.debug(f"Risk check blocked: {size_result.reason}")
                 continue
 
             logger.info(
-                f"SIGNAL: {sig.strategy} | {sig.outcome} on {sig.question[:60]}\n"
-                f"        Edge={sig.edge*100:+.1f}% EV={sig.ev*100:+.1f}¢ "
-                f"Conf={sig.confidence*100:.0f}% Kelly={sig.kelly_fraction*100:.1f}% "
-                f"Size=${size_result.size_usdc:.2f}\n"
-                f"        {sig.rationale.split(chr(10))[0]}"
+                f"SIGNAL: {sig.strategy} | {sig.outcome} on "
+                f"{sig.question[:60]}\n"
+                f"        Edge={sig.edge*100:+.1f}% "
+                f"EV={sig.ev*100:+.1f}¢ "
+                f"Conf={sig.confidence*100:.0f}% "
+                f"Size=${size_result.size_usdc:.2f}"
             )
 
             trade_uuid = await self.executor.enter_position(sig, size_result)
@@ -263,7 +363,8 @@ class PolymarketBTCBot:
             "win_rate":     snap["win_rate"],
             "total_trades": stats.get("total", 0),
             "max_drawdown": snap["max_drawdown"],
-            "goal_pct":     (snap["total_balance"] / TRADING.TARGET_BANKROLL) * 100,
+            "goal_pct":     (snap["total_balance"] /
+                             TRADING.TARGET_BANKROLL) * 100,
         })
 
     def _get_btc_vol(self) -> float:
@@ -286,7 +387,8 @@ class PolymarketBTCBot:
 
         return {
             "bot": {
-                "uptime_hours": round((time.time() - self.start_time.timestamp()) / 3600, 1),
+                "uptime_hours": round(
+                    (time.time() - self.start_time.timestamp()) / 3600, 1),
                 "cycle_count":  self.cycle_count,
                 "is_halted":    state["is_halted"],
                 "halt_reason":  state["halt_reason"],
@@ -305,9 +407,10 @@ class PolymarketBTCBot:
             "performance": {
                 "total_trades":  n,
                 "win_rate":      round(wins / n * 100, 1) if n else 0,
-                "profit_factor": round(gross_profit / gross_loss, 3) if gross_loss else 999,
+                "profit_factor": (round(gross_profit / gross_loss, 3)
+                                  if gross_loss else 999),
                 "avg_pnl_pct":   round(stats.get("avg_pnl_pct", 0) or 0, 4),
-                "best_trade":    round(stats.get("best_trade", 0) or 0, 4),
+                "best_trade":    round(stats.get("best_trade",  0) or 0, 4),
                 "worst_trade":   round(stats.get("worst_trade", 0) or 0, 4),
             },
             "market": {
@@ -324,11 +427,9 @@ class PolymarketBTCBot:
                 "days_left":     TRADING.TARGET_DAYS - days,
                 "target":        TRADING.TARGET_BANKROLL,
                 "pct_to_goal":   round(
-                    (state["bankroll"] / TRADING.TARGET_BANKROLL) * 100, 1
-                ),
+                    (state["bankroll"] / TRADING.TARGET_BANKROLL) * 100, 1),
                 "required_daily_return": round(
-                    self.risk.required_daily_return(days), 1
-                ),
+                    self.risk.required_daily_return(days), 1),
             },
         }
 
@@ -347,89 +448,46 @@ async def run_bot():
 
 
 async def run_backtest():
-    """Quick backtest using local DB candles"""
     from src.backtesting.backtest import Backtester
-
     db      = Database(DATABASE.DB_PATH)
     candles = db.get_candles(limit=5000)
-
     if len(candles) < 120:
         print("Not enough candle data. Run: python main.py seed")
         return
-
     print(f"Running backtest on {len(candles)} candles...")
     bt     = Backtester(TRADING, db)
-    result = bt.run(candles, start_idx=60, initial_capital=TRADING.INITIAL_BANKROLL)
+    result = bt.run(candles, start_idx=60,
+                    initial_capital=TRADING.INITIAL_BANKROLL)
     print(result.summary())
-
-    db.log("INFO", "BACKTEST", f"Backtest complete: {result.total_return*100:.1f}% return",
+    db.log("INFO", "BACKTEST",
+           f"Backtest complete: {result.total_return*100:.1f}% return",
            {"run_id": result.run_id, "trades": result.total_trades})
 
 
 async def seed_history():
-    """Pre-seed the DB with 30 days of 1m candles from Binance"""
-    import aiohttp
+    """Pre-seed the DB with historical candles from CoinGecko (no geo-block)"""
     db = Database(DATABASE.DB_PATH)
-    print("Downloading 30d of 1m candles from Binance...")
+    print("Seeding price history from CoinGecko...")
     async with aiohttp.ClientSession() as session:
-        end_time = int(time.time() * 1000)
-        total    = 0
-        for _ in range(30):
-            params = {
-                "symbol": "BTCUSDT", "interval": "1m",
-                "limit": "1000", "endTime": str(end_time)
-            }
-            async with session.get(
-                "https://api.binance.com/api/v3/klines", params=params
-            ) as resp:
-                klines = await resp.json()
-            if not klines:
-                break
-            for k in klines:
-                ts = int(k[0]) // 1000
-                db.upsert_candle(ts, float(k[1]), float(k[2]),
-                                 float(k[3]), float(k[4]), float(k[5]))
-            end_time = int(klines[0][0]) - 1
-            total   += len(klines)
-            print(f"  Downloaded {total} candles...")
-            await asyncio.sleep(0.5)
-    print(f"Done. {total} candles saved.")
-
-async def _poll_telegram_commands(self):
-    """Check for /status command from user"""
-    offset = 0
-    while self._running:
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"https://api.telegram.org/bot{API.TELEGRAM_BOT_TOKEN}/getUpdates",
-                    params={"offset": offset, "timeout": 30},
-                    timeout=aiohttp.ClientTimeout(total=35)
-                ) as resp:
-                    data = await resp.json()
-
-                for update in data.get("result", []):
-                    offset = update["update_id"] + 1
-                    text   = (update.get("message", {})
-                                    .get("text", "")).strip().lower()
-                    if text == "/status":
-                        await self.tg.send_status(self)
-                    elif text == "/balance":
-                        state = self.risk.get_state()
-                        await self.tg.send(
-                            f"💵 Balance: ${state['bankroll']:.2f}\n"
-                            f"📈 P&L: ${state['total_pnl']:+.2f}"
-                        )
-                    elif text == "/stop":
-                        await self.tg.send("🛑 Bot stopping...")
-                        self._running = False
-        except Exception as e:
-            logger.debug(f"Telegram poll error: {e}")
-        await asyncio.sleep(5)
+        # CoinGecko returns hourly data for last 90 days
+        async with session.get(
+            "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
+            params={"vs_currency": "usd", "days": "30", "interval": "hourly"},
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as resp:
+            data = await resp.json()
+        prices = data.get("prices", [])
+        count  = 0
+        for p in prices:
+            ts    = int(p[0]) // 1000
+            price = float(p[1])
+            db.upsert_candle(ts, price, price * 1.001,
+                             price * 0.999, price, 10.0)
+            count += 1
+        print(f"Done. {count} candles saved from CoinGecko.")
 
 
 if __name__ == "__main__":
-    import sys
     cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
 
     if cmd == "run":
