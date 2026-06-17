@@ -85,3 +85,35 @@ class TelegramBot:
             f"📉 Drawdown: {stats.get('max_drawdown',0)*100:.1f}%\n"
             f"🎯 Goal: {stats.get('goal_pct',0):.1f}% of $1,000"
         )
+async def send_status(self, bot_instance):
+    """Send current open trades on demand"""
+    open_trades = bot_instance.executor.get_open_positions_summary()
+    state       = bot_instance.risk.get_state()
+    stats       = bot_instance.db.get_trade_stats()
+
+    n     = stats.get("total", 0)
+    wins  = stats.get("wins",  0)
+    wr    = f"{wins/n*100:.1f}%" if n else "—"
+
+    msg = (
+        f"📊 <b>BOT STATUS</b>\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"💵 Balance: <b>${state['bankroll']:.2f}</b>\n"
+        f"📈 Total P&L: <b>${state['total_pnl']:+.2f}</b>\n"
+        f"🏆 Win Rate: {wr} ({n} trades)\n"
+        f"📊 Open Positions: {len(open_trades)}\n\n"
+    )
+
+    if open_trades:
+        msg += "<b>Open Trades:</b>\n"
+        for t in open_trades:
+            msg += (
+                f"  • {t['outcome']} {t['question'][:40]}...\n"
+                f"    Size: ${t['size_usdc']:.2f} | "
+                f"Entry: {t['entry_price']:.4f} | "
+                f"Held: {t['hold_minutes']:.0f}m\n"
+            )
+    else:
+        msg += "No open positions."
+
+    await self.send(msg)
