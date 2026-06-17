@@ -71,6 +71,7 @@ class PolymarketBTCBot:
         self.cycle_count = 0
         self._running    = False
         self._analyzed_markets: set = set()
+        self._latest_markets: list = []
 
     # ─────────────────────────────────────────────────────────────────────
     # Bootstrap
@@ -231,13 +232,16 @@ class PolymarketBTCBot:
                     last_sentiment = now
 
                 if now - last_market_refresh > 90:
-                    markets = await self.pm.get_btc_hourly_markets(
+                    self._latest_markets = await self.pm.get_btc_hourly_markets(
                         force_refresh=True)
-                    for m in markets:
-                        self.db.upsert_market(m)
+                    for m in self._latest_markets:
+                        try:
+                            self.db.upsert_market(m)
+                        except Exception:
+                            pass
                     last_market_refresh = now
                     logger.info(
-                        f"Markets refreshed: {len(markets)} active BTC markets")
+                        f"Markets refreshed: {len(self._latest_markets)} active BTC markets")
 
                 if now - last_monitor > 30:
                     btc_vol = self._get_btc_vol()
@@ -270,19 +274,18 @@ class PolymarketBTCBot:
             await self.tg.circuit_breaker(self.risk.halt_reason)
             return
 
-        markets = self.db.get_active_markets()
-        if not markets:
-            logger.debug("No active markets in DB")
+        # Use latest markets directly — avoids DB ID issues
+        all_markets = getattr(self, "_latest_markets", [])
+        if not all_markets:
+            # Fallback: fetch fresh
+            all_markets = await self.pm.get_btc_hourly_markets()
+
+        if not all_markets:
+            logger.debug("No active markets available")
             return
 
-        fresh = await self.pm.get_btc_hourly_markets()
-
-        market_map = {m["id"]: m for m in markets}
-        for m in fresh:
-            market_map[m["id"]] = m
-
-        all_markets = list(market_map.values())
-        signals     = self.scanner.scan(all_markets)
+        logger.info(f"Scanning {len(all_markets)} markets for signals...")
+        signals = self.scanner.scan(all_markets)
 
         if not signals:
             logger.debug("No actionable signals this cycle")
