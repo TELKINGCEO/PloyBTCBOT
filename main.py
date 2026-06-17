@@ -100,6 +100,7 @@ class PolymarketBTCBot:
 
         logger.info("Bot initialized. Starting main loop...")
         await self.tg.startup(balance=self.risk.bankroll)
+        asyncio.create_task(self._poll_telegram_commands())
         await self._main_loop()
 
     async def stop(self):
@@ -393,6 +394,38 @@ async def seed_history():
             print(f"  Downloaded {total} candles...")
             await asyncio.sleep(0.5)
     print(f"Done. {total} candles saved.")
+
+async def _poll_telegram_commands(self):
+    """Check for /status command from user"""
+    offset = 0
+    while self._running:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"https://api.telegram.org/bot{API.TELEGRAM_BOT_TOKEN}/getUpdates",
+                    params={"offset": offset, "timeout": 30},
+                    timeout=aiohttp.ClientTimeout(total=35)
+                ) as resp:
+                    data = await resp.json()
+
+                for update in data.get("result", []):
+                    offset = update["update_id"] + 1
+                    text   = (update.get("message", {})
+                                    .get("text", "")).strip().lower()
+                    if text == "/status":
+                        await self.tg.send_status(self)
+                    elif text == "/balance":
+                        state = self.risk.get_state()
+                        await self.tg.send(
+                            f"💵 Balance: ${state['bankroll']:.2f}\n"
+                            f"📈 P&L: ${state['total_pnl']:+.2f}"
+                        )
+                    elif text == "/stop":
+                        await self.tg.send("🛑 Bot stopping...")
+                        self._running = False
+        except Exception as e:
+            logger.debug(f"Telegram poll error: {e}")
+        await asyncio.sleep(5)
 
 
 if __name__ == "__main__":
