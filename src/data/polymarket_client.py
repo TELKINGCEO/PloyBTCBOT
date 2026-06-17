@@ -78,32 +78,53 @@ class PolymarketClient:
     # ─────────────────────────────────────────────────────────────────────
     async def get_btc_hourly_markets(self, force_refresh: bool = False) -> List[Dict]:
         """
-        Returns ONLY:
-          - Bitcoin 15-minute markets  e.g. "Bitcoin Up or Down - June 17, 2:00AM-2:15AM ET"
-          - Bitcoin 1-hour markets     e.g. "Bitcoin above $67,000 on June 17?"
-        All other markets are ignored.
+        Fetches ONLY:
+          - BTC 15-min markets  slug pattern: btc-updown-15m-{timestamp}
+          - BTC 1-hour markets  slug pattern: bitcoin-up-or-down-{date}-{time}-et
+
+        Individual market questions are just "Up" / "Down" so we
+        filter by the EVENT slug, not the question text.
         """
         now = time.time()
         if (not force_refresh and self._markets_cache
                 and (now - self._cache_ts) < self._cache_ttl):
             return self._markets_cache
 
-        session  = await self._get_session()
-        all_raw  = []
+        session = await self._get_session()
+        markets_15m = []
+        markets_1h  = []
 
-        # ── Fetch from multiple endpoints ─────────────────────────────────
-        fetch_configs = [
-            # Bitcoin tag slug
-            {"active": "true", "closed": "false",
-             "limit": "200", "tag_slug": "bitcoin"},
-            # Crypto category
-            {"active": "true", "closed": "false",
-             "limit": "200", "category": "crypto"},
-            # All active (fallback)
+        # ── Fetch events from Gamma API ───────────────────────────────────
+        # Events contain nested markets (Up/Down outcomes)
+        # We search broadly then filter by slug pattern
+        all_events = []
+
+        fetch_params = [
+            {"active": "true", "closed": "false", "limit": "200",
+             "tag_slug": "bitcoin"},
+            {"active": "true", "closed": "false", "limit": "200",
+             "tag_slug": "crypto"},
             {"active": "true", "closed": "false", "limit": "500"},
         ]
 
-        for params in fetch_configs:
+        for params in fetch_params:
+            try:
+                async with session.get(
+                    f"{self.GAMMA_URL}/events",
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        events = (data if isinstance(data, list)
+                                  else data.get("events", []))
+                        all_events.extend(events)
+            except Exception as e:
+                logger.debug(f"Events fetch failed ({params}): {e}")
+
+        # Also try markets endpoint (some may not be under events)
+        all_markets_raw = []
+        for params in fetch_params[:2]:
             try:
                 async with session.get(
                     f"{self.GAMMA_URL}/markets",
@@ -114,76 +135,48 @@ class PolymarketClient:
                         data = await resp.json()
                         raw  = (data if isinstance(data, list)
                                 else data.get("markets", []))
-                        all_raw.extend(raw)
+                        all_markets_raw.extend(raw)
             except Exception as e:
-                logger.debug(f"Fetch failed ({params}): {e}")
+                logger.debug(f"Markets fetch failed: {e}")
 
-        # Also try events endpoint
-        try:
-            async with session.get(
-                f"{self.GAMMA_URL}/events",
-                params={"active": "true", "closed": "false",
-                        "limit": "100", "tag_slug": "bitcoin"},
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as resp:
-                if resp.status == 200:
-                    data   = await resp.json()
-                    events = (data if isinstance(data, list)
-                              else data.get("events", []))
-                    for event in events:
-                        for m in event.get("markets", []):
-                            all_raw.append(m)
-        except Exception as e:
-            logger.debug(f"Events fetch failed: {e}")
+        # ── Deduplicate events by slug ────────────────────────────────────
+        seen_events = set()
+        unique_events = []
+        for e in all_events:
+            slug = e.get("slug", "") or e.get("eventSlug", "")
+            if slug and slug not in seen_events:
+                seen_events.add(slug)
+                unique_events.append(e)
 
-        # ── Deduplicate ───────────────────────────────────────────────────
-        seen, unique = set(), []
-        for m in all_raw:
-            mid = (m.get("id") or m.get("conditionId") or "")
-            if mid and mid not in seen:
-                seen.add(mid)
-                unique.append(m)
+        logger.debug(f"Unique events: {len(unique_events)}")
 
-        # ── Strict filter: only 15min and 1hour BTC markets ──────────────
-        markets_15m = []
-        markets_1h  = []
+        # ── Filter events by slug pattern ─────────────────────────────────
+        for event in unique_events:
+            slug  = (event.get("slug") or
+                     event.get("eventSlug") or "").lower()
+            title = (event.get("title") or
+                     event.get("name") or "").lower()
 
-        for m in unique:
-            q = (m.get("question") or "").lower().strip()
+            # 15-min market: slug starts with "btc-updown-15m-"
+            is_15min = slug.startswith("btc-updown-15m-")
 
-            # Skip if not Bitcoin related
-            if "bitcoin" not in q and "btc" not in q:
-                continue
-
-            # Skip if already resolved/closed
-            if m.get("resolved") or m.get("isResolved"):
-                continue
-
-            # Detect 15-minute market
-            # Core name never changes: "BTC Up or Down 15m"
-            # Only the date/time suffix changes each cycle
-            is_15min = (
-                "btc" in q and
-                "up or down" in q and
-                "15m" in q
-            )
-
-            # Detect 1-hour market
-            # Core name never changes: "BTC Up or Down Hourly"
-            # Only the date/time suffix changes each cycle
+            # 1-hour market: slug matches "bitcoin-up-or-down-*-et"
+            # e.g. bitcoin-up-or-down-june-17-2026-2am-et
             is_1hour = (
-                "btc" in q and
-                "up or down" in q and
-                "hourly" in q
+                slug.startswith("bitcoin-up-or-down-") and
+                slug.endswith("-et") and
+                "15m" not in slug and
+                "5m"  not in slug
             )
+
             if not is_15min and not is_1hour:
                 continue
 
-            # ── Extract end time ──────────────────────────────────────────
+            # Extract end time from event
             end_ts  = 0
-            end_str = (m.get("endDate") or m.get("end_date_iso") or
-                       m.get("endDateIso") or m.get("end_date") or
-                       m.get("endTime") or "")
+            end_str = (event.get("endDate") or
+                       event.get("end_date_iso") or
+                       event.get("endDateIso") or "")
             if end_str:
                 try:
                     dt     = datetime.fromisoformat(
@@ -193,8 +186,7 @@ class PolymarketClient:
                     pass
 
             if end_ts == 0:
-                end_ts = int(m.get("endTimestamp", 0) or
-                             m.get("end_timestamp", 0) or 0)
+                end_ts = int(event.get("endTimestamp", 0) or 0)
 
             time_to_expiry = end_ts - int(now) if end_ts > 0 else 0
 
@@ -204,11 +196,80 @@ class PolymarketClient:
 
             market_type = "btc_15min" if is_15min else "btc_1hour"
 
+            # Use nested markets for prices if available
+            nested = event.get("markets", [])
+            prices = [0.5, 0.5]
+            market_id = event.get("id", "") or event.get("conditionId", "")
+
+            if nested:
+                # First nested market is usually the YES/UP outcome
+                prices = self._extract_prices(nested[0])
+                if not market_id:
+                    market_id = nested[0].get("id", "")
+
             entry = {
-                "id":             (m.get("id") or m.get("conditionId") or ""),
+                "id":             market_id,
+                "condition_id":   event.get("conditionId", ""),
+                "question":       event.get("title", slug),
+                "slug":           slug,
+                "outcomes":       json.dumps(["Up", "Down"]),
+                "outcome_prices": json.dumps(prices),
+                "volume":         float(event.get("volume",    0) or 0),
+                "liquidity":      float(event.get("liquidity", 0) or 0),
+                "end_time":       end_ts,
+                "start_time":     0,
+                "market_type":    market_type,
+                "time_to_expiry": max(0, time_to_expiry),
+                "raw":            event,
+                "nested_markets": nested,
+            }
+
+            if is_15min:
+                markets_15m.append(entry)
+            else:
+                markets_1h.append(entry)
+
+        # ── Also check raw markets for any missed by events ───────────────
+        seen_ids = {m["id"] for m in markets_15m + markets_1h}
+        for m in all_markets_raw:
+            slug = (m.get("slug") or
+                    m.get("marketSlug") or "").lower()
+            mid  = m.get("id", "")
+
+            if mid in seen_ids:
+                continue
+
+            is_15min = slug.startswith("btc-updown-15m-")
+            is_1hour = (
+                slug.startswith("bitcoin-up-or-down-") and
+                slug.endswith("-et") and
+                "15m" not in slug and "5m" not in slug
+            )
+
+            if not is_15min and not is_1hour:
+                continue
+
+            end_ts  = 0
+            end_str = (m.get("endDate") or m.get("end_date_iso") or "")
+            if end_str:
+                try:
+                    dt     = datetime.fromisoformat(
+                        str(end_str).replace("Z", "+00:00"))
+                    end_ts = int(dt.timestamp())
+                except Exception:
+                    pass
+
+            time_to_expiry = end_ts - int(now) if end_ts > 0 else 0
+            if end_ts > 0 and time_to_expiry < -300:
+                continue
+
+            market_type = "btc_15min" if is_15min else "btc_1hour"
+            entry = {
+                "id":             mid,
                 "condition_id":   m.get("conditionId", ""),
-                "question":       m.get("question", ""),
-                "outcomes":       json.dumps(m.get("outcomes", ["YES", "NO"])),
+                "question":       m.get("question") or m.get("title") or slug,
+                "slug":           slug,
+                "outcomes":       json.dumps(["Up", "Down"]),
                 "outcome_prices": json.dumps(self._extract_prices(m)),
                 "volume":         float(m.get("volume",    0) or 0),
                 "liquidity":      float(m.get("liquidity", 0) or 0),
@@ -217,29 +278,26 @@ class PolymarketClient:
                 "market_type":    market_type,
                 "time_to_expiry": max(0, time_to_expiry),
                 "raw":            m,
+                "nested_markets": [],
             }
-
             if is_15min:
                 markets_15m.append(entry)
             else:
                 markets_1h.append(entry)
 
-        # Sort each group by soonest expiry
+        # Sort by soonest expiry first
         markets_15m.sort(key=lambda x: x["end_time"] if x["end_time"] > 0
                          else float("inf"))
-        markets_1h.sort(key=lambda x: x["end_time"] if x["end_time"] > 0
+        markets_1h.sort(key=lambda x: x["end_time"]  if x["end_time"] > 0
                         else float("inf"))
 
-        # Combine: 15min first, then 1hour
         markets = markets_15m + markets_1h
 
         logger.info(
             f"Found {len(markets)} target BTC markets: "
-            f"{len(markets_15m)} x 15min, {len(markets_1h)} x 1hour "
-            f"(from {len(unique)} total scanned)"
+            f"{len(markets_15m)} x 15min, {len(markets_1h)} x 1hour"
         )
-
-        for mkt in markets[:10]:
+        for mkt in markets[:8]:
             logger.info(
                 f"  [{mkt['market_type']:>10}] "
                 f"[{mkt['time_to_expiry']//60:>4}min] "
@@ -250,7 +308,7 @@ class PolymarketClient:
         self._markets_cache = markets
         self._cache_ts      = now
         return markets
-    
+
     def _extract_prices(self, market: Dict) -> List[float]:
         """Extract YES/NO prices from market data"""
         tokens = market.get("tokens") or []
